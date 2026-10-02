@@ -21,6 +21,18 @@ pub struct ProviderConfig {
     /// USD per minute of audio sent. `None` → built-in estimate for known models.
     #[serde(default)]
     pub price_per_minute: Option<f64>,
+    /// USD per 1M input/output tokens. Used instead of the per-minute price when the
+    /// provider reports token counts. `None` → built-in rates for known models.
+    #[serde(default)]
+    pub price_input_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub price_output_per_mtok: Option<f64>,
+}
+
+/// Published token prices (USD per 1M input, 1M output) for models billed by tokens.
+pub fn known_token_price(model: &str) -> Option<(f64, f64)> {
+    let m = model.to_lowercase();
+    m.contains("gemini-3.5-transcribe").then_some((2.0, 12.0))
 }
 
 /// Published list prices (USD per audio minute) for common models, used for estimates.
@@ -43,16 +55,50 @@ impl ProviderConfig {
     pub fn effective_price(&self) -> f64 {
         self.price_per_minute.filter(|p| p.is_finite() && *p >= 0.0).unwrap_or_else(|| known_price(&self.model))
     }
+
+    pub fn token_price(&self) -> Option<(f64, f64)> {
+        let valid = |p: Option<f64>| p.filter(|v| v.is_finite() && *v >= 0.0);
+        match (valid(self.price_input_per_mtok), valid(self.price_output_per_mtok)) {
+            (Some(i), Some(o)) => Some((i, o)),
+            _ => known_token_price(&self.model),
+        }
+    }
+
+    /// Whether this provider/model returns speaker labels.
+    pub fn diarizes(&self) -> bool {
+        self.kind == ProviderKind::Gemini || self.model.contains("diarize")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SilenceMethod {
+    /// Neural voice activity detection: drops anything that isn't speech (noise, music, hum).
+    Speech,
+    /// Volume threshold (ffmpeg silencedetect): only drops true quiet.
+    Volume,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Schema version for migrating saved settings; missing in files from v1.
+    #[serde(default)]
+    pub settings_version: u32,
     pub providers: Vec<ProviderConfig>,
+    /// Used when speaker labels aren't needed (cheapest).
     pub default_provider: String,
+    /// Used when speaker labels are requested.
+    pub diarize_provider: String,
     pub language: String,
+    /// Speed-up for providers without diarization (Whisper copes well up to ~2×).
     pub speed: f64,
+    /// Speed-up for diarizing providers; kept lower since voice identification is untested at high speed.
+    pub diarize_speed: f64,
     pub remove_silence: bool,
+    pub silence_method: SilenceMethod,
+    /// Speech probability above which a frame counts as speech (0..1). Lower keeps more.
+    pub vad_threshold: f64,
     pub silence_threshold_db: f64,
     pub silence_min_duration: f64,
     /// Chunk length for Whisper-style providers (Groq caps uploads at 25 MB).
@@ -73,6 +119,8 @@ impl Default for Settings {
                     api_key: String::new(),
                     model: "whisper-large-v3-turbo".into(),
                     price_per_minute: None,
+                    price_input_per_mtok: None,
+                    price_output_per_mtok: None,
                 },
                 ProviderConfig {
                     id: "openai".into(),
@@ -82,6 +130,8 @@ impl Default for Settings {
                     api_key: String::new(),
                     model: "whisper-1".into(),
                     price_per_minute: None,
+                    price_input_per_mtok: None,
+                    price_output_per_mtok: None,
                 },
                 ProviderConfig {
                     id: "gemini".into(),
@@ -91,12 +141,19 @@ impl Default for Settings {
                     api_key: String::new(),
                     model: "gemini-3.5-transcribe".into(),
                     price_per_minute: None,
+                    price_input_per_mtok: None,
+                    price_output_per_mtok: None,
                 },
             ],
-            default_provider: "gemini".into(),
+            settings_version: CURRENT_VERSION,
+            default_provider: "groq".into(),
+            diarize_provider: "gemini".into(),
             language: String::new(),
-            speed: 1.25,
+            speed: 1.5,
+            diarize_speed: 1.25,
             remove_silence: true,
+            silence_method: SilenceMethod::Speech,
+            vad_threshold: 0.5,
             silence_threshold_db: -35.0,
             silence_min_duration: 0.7,
             chunk_minutes: 10.0,
@@ -105,11 +162,34 @@ impl Default for Settings {
     }
 }
 
+const CURRENT_VERSION: u32 = 2;
+
 pub fn load(path: &Path) -> Settings {
-    std::fs::read_to_string(path)
+    let s: Settings = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    migrate(s)
+}
+
+/// v1 → v2: Groq becomes the default (Gemini only for speaker labels) and Whisper speed goes to 1.5×,
+/// unless the user had changed those values.
+fn migrate(mut s: Settings) -> Settings {
+    if s.settings_version < 2 {
+        if s.default_provider == "gemini" {
+            s.default_provider = "groq".into();
+        }
+        if (s.speed - 1.25).abs() < 1e-9 {
+            s.speed = 1.5;
+        }
+        s.settings_version = 2;
+    }
+    if !s.providers.iter().any(|p| p.id == s.diarize_provider) {
+        if let Some(p) = s.providers.iter().find(|p| p.diarizes()) {
+            s.diarize_provider = p.id.clone();
+        }
+    }
+    s
 }
 
 pub fn save(path: &Path, s: &Settings) -> Result<()> {
@@ -131,5 +211,23 @@ mod tests {
         assert_eq!(known_price("gpt-4o-transcribe-diarize"), 0.006);
         assert_eq!(known_price("gpt-4o-mini-transcribe"), 0.003);
         assert_eq!(known_price("my-local-model"), 0.0);
+        assert_eq!(known_token_price("gemini-3.5-transcribe"), Some((2.0, 12.0)));
+        assert_eq!(known_token_price("whisper-1"), None);
+    }
+
+    #[test]
+    fn migrates_v1_settings() {
+        let v1 = r#"{"providers": [], "default_provider": "gemini", "language": "", "speed": 1.25,
+            "remove_silence": true, "silence_threshold_db": -35, "silence_min_duration": 0.7,
+            "chunk_minutes": 10, "gemini_chunk_minutes": 25}"#;
+        let s = migrate(serde_json::from_str(v1).unwrap());
+        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 2));
+        assert_eq!(s.silence_method, SilenceMethod::Speech);
+        // A user's own choices are kept.
+        let custom = v1.replace("\"gemini\"", "\"openai\"").replace("1.25", "1.1");
+        let s = migrate(serde_json::from_str(&custom).unwrap());
+        assert_eq!((s.default_provider.as_str(), s.speed), ("openai", 1.1));
+        // Fresh defaults are already current.
+        assert_eq!(migrate(Settings::default()).default_provider, "groq");
     }
 }

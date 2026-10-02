@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { api, type Settings } from "@/lib/api";
+import { api, diarizes, type SilenceMethod, type Settings } from "@/lib/api";
 import { useSettings } from "@/stores/settings";
 
 const store = useSettings();
@@ -16,7 +16,7 @@ const form = ref<Settings | null>(null);
 const reveal = ref<Record<string, boolean>>({});
 const BUILTIN = ["groq", "openai", "gemini"];
 // Built-in price estimate per provider, shown as the placeholder of the price field.
-const estimates = reactive<Record<string, number>>({});
+const estimates = reactive<Record<string, { per_minute: number; tokens: [number, number] | null }>>({});
 watchEffect(() => {
   for (const p of form.value?.providers ?? []) {
     const model = p.model;
@@ -24,16 +24,13 @@ watchEffect(() => {
   }
 });
 
-function priceModel(p: Settings["providers"][number]) {
-  return {
-    get value() {
-      return p.price_per_minute ?? "";
-    },
-    set value(v: string | number) {
-      const n = typeof v === "number" ? v : parseFloat(v);
-      p.price_per_minute = v === "" || Number.isNaN(n) ? null : n;
-    },
-  };
+type Provider = Settings["providers"][number];
+type PriceKey = "price_per_minute" | "price_input_per_mtok" | "price_output_per_mtok";
+
+/** Optional numeric field: empty input = null (use the built-in estimate). */
+function setPrice(p: Provider, key: PriceKey, v: string | number) {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  p[key] = v === "" || Number.isNaN(n) ? null : n;
 }
 
 onMounted(async () => {
@@ -49,6 +46,8 @@ function addProvider() {
     api_key: "",
     model: "whisper-1",
     price_per_minute: null,
+    price_input_per_mtok: null,
+    price_output_per_mtok: null,
   });
 }
 
@@ -56,6 +55,7 @@ function removeProvider(id: string) {
   const f = form.value!;
   f.providers = f.providers.filter((p) => p.id !== id);
   if (f.default_provider === id) f.default_provider = f.providers[0]?.id ?? "";
+  if (f.diarize_provider === id) f.diarize_provider = f.providers.find((p) => diarizes(p))?.id ?? f.default_provider;
 }
 
 async function save() {
@@ -108,13 +108,35 @@ async function save() {
                 <div class="grid gap-1.5">
                   <Label>Price per audio minute (USD)</Label>
                   <Input
-                    :model-value="priceModel(p).value"
+                    :model-value="p.price_per_minute ?? ''"
                     type="number"
                     min="0"
                     step="0.0001"
-                    :placeholder="estimates[p.id] !== undefined ? `${estimates[p.id].toFixed(5)} (built-in estimate)` : ''"
-                    @update:model-value="(v) => (priceModel(p).value = v)"
+                    :placeholder="estimates[p.id] ? `${estimates[p.id].per_minute.toFixed(5)} (built-in)` : ''"
+                    @update:model-value="(v) => setPrice(p, 'price_per_minute', v)"
                   />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label>Token price per 1M, in / out (USD)</Label>
+                  <div class="flex gap-2">
+                    <Input
+                      :model-value="p.price_input_per_mtok ?? ''"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      :placeholder="estimates[p.id]?.tokens ? `${estimates[p.id].tokens![0]} (built-in)` : 'in'"
+                      @update:model-value="(v) => setPrice(p, 'price_input_per_mtok', v)"
+                    />
+                    <Input
+                      :model-value="p.price_output_per_mtok ?? ''"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      :placeholder="estimates[p.id]?.tokens ? `${estimates[p.id].tokens![1]} (built-in)` : 'out'"
+                      @update:model-value="(v) => setPrice(p, 'price_output_per_mtok', v)"
+                    />
+                  </div>
+                  <p class="text-muted-foreground text-xs">Used instead of the per-minute price when the provider reports tokens.</p>
                 </div>
               </div>
             </div>
@@ -129,25 +151,55 @@ async function save() {
           </CardHeader>
           <CardContent class="grid grid-cols-2 gap-4">
             <div class="grid gap-1.5">
-              <Label>Default provider</Label>
+              <Label>Provider — text only</Label>
               <Select v-model="form.default_provider">
                 <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem v-for="p in form.providers" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
                 </SelectContent>
               </Select>
+              <p class="text-muted-foreground text-xs">Default. Pick the cheapest — Groq turbo is ~$0.04 per hour sent.</p>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Provider — with speaker labels</Label>
+              <Select v-model="form.diarize_provider">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="p in form.providers.filter((x) => diarizes(x))" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">Used when “Speaker labels” is switched on.</p>
             </div>
             <div class="grid gap-1.5"><Label>Language</Label><Input v-model="form.language" placeholder="Auto-detect" /></div>
+            <div />
             <div class="grid gap-1.5">
-              <Label>Speed (1.0–2.0)</Label>
+              <Label>Speed — text only (1.0–2.0)</Label>
               <Input v-model.number="form.speed" type="number" min="1" max="2" step="0.05" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Speed — with speaker labels</Label>
+              <Input v-model.number="form.diarize_speed" type="number" min="1" max="2" step="0.05" />
             </div>
             <div class="flex items-end justify-between gap-3 pb-2">
               <Label for="def-rm">Remove silence</Label>
               <Switch id="def-rm" v-model="form.remove_silence" />
             </div>
             <div class="grid gap-1.5">
-              <Label>Silence threshold (dB)</Label>
+              <Label>Detect</Label>
+              <Select :model-value="form.silence_method" @update:model-value="(v) => (form!.silence_method = v as SilenceMethod)">
+                <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="speech">Non-speech (AI, recommended)</SelectItem>
+                  <SelectItem value="volume">Quiet only (volume)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Speech threshold (0.2–0.8)</Label>
+              <Input v-model.number="form.vad_threshold" type="number" min="0.2" max="0.8" step="0.05" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Silence threshold — volume (dB)</Label>
               <Input v-model.number="form.silence_threshold_db" type="number" min="-60" max="-20" step="1" />
             </div>
             <div class="grid gap-1.5">

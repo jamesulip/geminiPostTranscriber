@@ -22,10 +22,22 @@ pub struct JobOptions {
     pub silence_threshold_db: f64,
     pub silence_min_duration: f64,
     pub chunk_minutes: f64,
+    #[serde(default = "default_method")]
+    pub silence_method: crate::settings::SilenceMethod,
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f64,
     pub title: Option<String>,
     pub folder_id: Option<i64>,
     #[serde(default)]
     pub tag_ids: Vec<i64>,
+}
+
+fn default_method() -> crate::settings::SilenceMethod {
+    crate::settings::SilenceMethod::Speech
+}
+
+fn default_vad_threshold() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +114,13 @@ pub async fn run(app: AppHandle, job: Job) {
             let title: String = db
                 .query_row("SELECT title FROM transcripts WHERE id = ?1", [&job.id], |r| r.get(0))
                 .unwrap_or_default();
+            let original = m.sent_seconds * m.ratio;
+            let (input, output) = (m.tokens.input_tokens as i64, m.tokens.output_tokens as i64);
+            // Prefer actual token counts when the provider reports them and we know its token prices.
+            let (cost_usd, saved_usd) = match job.provider.token_price() {
+                Some(p) if input > 0 => db::token_cost(input, output, p, original, m.sent_seconds),
+                _ => db::minute_cost(original, m.sent_seconds, job.provider.effective_price()),
+            };
             let _ = db::insert_usage(
                 &db,
                 &db::NewUsage {
@@ -111,12 +130,14 @@ pub async fn run(app: AppHandle, job: Job) {
                     provider_name: &job.provider.name,
                     model: &job.provider.model,
                     status,
-                    original_seconds: m.sent_seconds * m.ratio,
+                    original_seconds: original,
                     sent_seconds: m.sent_seconds,
                     requests: m.requests,
-                    input_tokens: m.tokens.input_tokens as i64,
-                    output_tokens: m.tokens.output_tokens as i64,
+                    input_tokens: input,
+                    output_tokens: output,
                     price_per_minute: job.provider.effective_price(),
+                    cost_usd,
+                    saved_usd,
                 },
             );
         }
@@ -158,6 +179,8 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
             silence_threshold_db: o.silence_threshold_db,
             silence_min_duration: o.silence_min_duration,
             chunk_seconds: o.chunk_minutes * 60.0,
+            method: o.silence_method.clone(),
+            vad_threshold: o.vad_threshold,
         },
     )
     .await?;
@@ -309,9 +332,9 @@ mod tests {
         let url = std::env::var("MOCK_URL").unwrap();
         let input = PathBuf::from(std::env::var("MOCK_AUDIO").unwrap());
         let work = std::env::temp_dir().join(format!("tx-e2e-{}", uuid::Uuid::new_v4()));
-        let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds: 30.0 };
+        let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds: 30.0, method: crate::settings::SilenceMethod::Speech, vad_threshold: 0.5 };
         let prepared = audio::preprocess(&input, &work, &opts).await.unwrap();
-        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None };
+        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None };
         let client = reqwest::Client::new();
         let mut per_chunk = vec![];
         for c in &prepared.chunks {

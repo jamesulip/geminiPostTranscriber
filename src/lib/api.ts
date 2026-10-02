@@ -11,14 +11,31 @@ export interface ProviderConfig {
   model: string;
   /** USD per audio minute; null = built-in estimate. */
   price_per_minute: number | null;
+  /** USD per 1M tokens, used when the provider reports tokens; null = built-in. */
+  price_input_per_mtok: number | null;
+  price_output_per_mtok: number | null;
+}
+
+export type SilenceMethod = "speech" | "volume";
+
+/** Whether a provider/model returns speaker labels. */
+export function diarizes(p: ProviderConfig | undefined): boolean {
+  return !!p && (p.kind === "gemini" || p.model.includes("diarize"));
 }
 
 export interface Settings {
+  settings_version: number;
   providers: ProviderConfig[];
+  /** Cheapest provider, used when speaker labels aren't needed. */
   default_provider: string;
+  /** Provider used when speaker labels are requested. */
+  diarize_provider: string;
   language: string;
   speed: number;
+  diarize_speed: number;
   remove_silence: boolean;
+  silence_method: SilenceMethod;
+  vad_threshold: number;
   silence_threshold_db: number;
   silence_min_duration: number;
   chunk_minutes: number;
@@ -160,6 +177,8 @@ export interface JobOptions {
   silence_threshold_db: number;
   silence_min_duration: number;
   chunk_minutes: number;
+  silence_method: SilenceMethod;
+  vad_threshold: number;
   title: string | null;
   folder_id: number | null;
   tag_ids: number[];
@@ -209,7 +228,8 @@ export const api = {
   deleteVersion: (versionId: number) => invoke<void>("delete_version", { versionId }),
 
   usageSummary: () => invoke<UsageSummary>("usage_summary"),
-  knownPrice: (model: string) => invoke<number>("known_price", { model }),
+  knownPrice: (model: string) =>
+    invoke<{ per_minute: number; tokens: [number, number] | null }>("known_price", { model }),
 
   listFolders: () => invoke<Folder[]>("list_folders"),
   createFolder: (name: string, parentId: number | null) => invoke<Folder>("create_folder", { name, parentId }),

@@ -5,12 +5,17 @@ import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { JobOptions, Settings } from "@/lib/api";
+import { diarizes, type JobOptions, type SilenceMethod, type Settings } from "@/lib/api";
+import { providerDefaults } from "@/lib/options";
 
 const opts = defineModel<JobOptions>({ required: true });
 const props = defineProps<{ settings: Settings }>();
 
 const provider = computed(() => props.settings.providers.find((p) => p.id === opts.value.provider_id));
+/** Provider with the model override applied (e.g. a typed-in `gpt-4o-transcribe-diarize`). */
+const effective = computed(() =>
+  provider.value ? { ...provider.value, model: opts.value.model?.trim() || provider.value.model } : undefined,
+);
 
 watch(
   () => opts.value.provider_id,
@@ -18,8 +23,23 @@ watch(
     if (!old || id === old) return;
     const p = props.settings.providers.find((x) => x.id === id);
     opts.value.model = p?.model ?? null;
-    opts.value.chunk_minutes = p?.kind === "gemini" ? props.settings.gemini_chunk_minutes : props.settings.chunk_minutes;
+    Object.assign(opts.value, providerDefaults(props.settings, p));
   },
+);
+
+/** Picking speaker labels switches between the cheap default and the diarizing provider. */
+const speakerLabels = computed({
+  get: () => diarizes(effective.value),
+  set: (on: boolean) => {
+    const id = on ? props.settings.diarize_provider : props.settings.default_provider;
+    if (props.settings.providers.some((p) => p.id === id)) opts.value.provider_id = id;
+  },
+});
+const canToggleLabels = computed(
+  () =>
+    props.settings.providers.some((p) => p.id === props.settings.diarize_provider) &&
+    props.settings.providers.some((p) => p.id === props.settings.default_provider) &&
+    props.settings.diarize_provider !== props.settings.default_provider,
 );
 
 const speed = computed({
@@ -30,11 +50,32 @@ const threshold = computed({
   get: () => [opts.value.silence_threshold_db],
   set: (v: number[] | undefined) => (opts.value.silence_threshold_db = v?.[0] ?? -35),
 });
+const vad = computed({
+  get: () => [opts.value.vad_threshold],
+  set: (v: number[] | undefined) => (opts.value.vad_threshold = v?.[0] ?? 0.5),
+});
+const method = computed({
+  get: () => opts.value.silence_method,
+  set: (v: string) => (opts.value.silence_method = v as SilenceMethod),
+});
+const providerName = (id: string) => props.settings.providers.find((p) => p.id === id)?.name ?? id;
 const missingKey = computed(() => provider.value && !provider.value.api_key.trim());
 </script>
 
 <template>
   <div class="grid gap-4">
+    <div class="flex items-start justify-between gap-4 rounded-lg border p-3">
+      <div class="grid gap-0.5">
+        <Label for="speaker-labels">Speaker labels</Label>
+        <p class="text-muted-foreground text-xs">
+          {{ speakerLabels
+            ? `Identifies who said what (${providerName(settings.diarize_provider)}). Roughly 8× the cost of text only.`
+            : `Text only with ${providerName(settings.default_provider)} — the cheapest option.` }}
+        </p>
+      </div>
+      <Switch id="speaker-labels" v-model="speakerLabels" :disabled="!canToggleLabels" />
+    </div>
+
     <div class="grid grid-cols-2 gap-3">
       <div class="grid gap-1.5">
         <Label>Provider</Label>
@@ -51,9 +92,6 @@ const missingKey = computed(() => provider.value && !provider.value.api_key.trim
       </div>
     </div>
     <p v-if="missingKey" class="text-destructive -mt-2 text-xs">No API key for {{ provider?.name }} — add one in Settings.</p>
-    <p v-else-if="provider?.kind === 'openai' && !opts.model?.includes('diarize')" class="text-muted-foreground -mt-2 text-xs">
-      Whisper models don't label speakers. Use Gemini (or <code>gpt-4o-transcribe-diarize</code>) for diarization.
-    </p>
 
     <div class="grid grid-cols-2 gap-3">
       <div class="grid gap-1.5">
@@ -69,11 +107,16 @@ const missingKey = computed(() => provider.value && !provider.value.api_key.trim
     <div class="grid gap-2">
       <div class="flex items-center justify-between">
         <Label>Speed</Label>
-        <span class="text-sm tabular-nums" :class="opts.speed > 1.5 && 'text-amber-600'">{{ opts.speed.toFixed(2) }}×</span>
+        <span class="text-sm tabular-nums" :class="opts.speed > (speakerLabels ? 1.5 : 1.9) && 'text-amber-600'">
+          {{ opts.speed.toFixed(2) }}×
+        </span>
       </div>
       <Slider v-model="speed" :min="1" :max="2" :step="0.05" />
       <p class="text-muted-foreground text-xs">
-        Faster audio is cheaper to transcribe. Above 1.5× accuracy may drop.
+        Faster audio is cheaper.
+        {{ speakerLabels
+          ? "Kept lower with speaker labels: voice identification hasn't been tested at high speed."
+          : "Whisper accuracy holds up well to about 2×." }}
       </p>
     </div>
 
@@ -83,12 +126,34 @@ const missingKey = computed(() => provider.value && !provider.value.api_key.trim
         <Switch id="rm-silence" v-model="opts.remove_silence" />
       </div>
       <template v-if="opts.remove_silence">
-        <div class="text-muted-foreground flex items-center justify-between text-xs">
-          <span>Silence threshold</span><span class="tabular-nums">{{ opts.silence_threshold_db }} dB</span>
+        <div class="flex items-center justify-between gap-3 text-xs">
+          <span class="text-muted-foreground">Detect</span>
+          <Select v-model="method">
+            <SelectTrigger size="sm" class="w-56"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="speech">Non-speech (AI)</SelectItem>
+              <SelectItem value="volume">Quiet only (volume)</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
-        <Slider v-model="threshold" :min="-60" :max="-20" :step="1" />
+        <template v-if="opts.silence_method === 'speech'">
+          <div class="text-muted-foreground flex items-center justify-between text-xs">
+            <span>Speech threshold <span class="opacity-70">(lower keeps more)</span></span>
+            <span class="tabular-nums">{{ opts.vad_threshold.toFixed(2) }}</span>
+          </div>
+          <Slider v-model="vad" :min="0.2" :max="0.8" :step="0.05" />
+          <p class="text-muted-foreground text-xs">
+            Also drops background noise, music and hum — cheaper, and fewer made-up lines from Whisper.
+          </p>
+        </template>
+        <template v-else>
+          <div class="text-muted-foreground flex items-center justify-between text-xs">
+            <span>Silence threshold</span><span class="tabular-nums">{{ opts.silence_threshold_db }} dB</span>
+          </div>
+          <Slider v-model="threshold" :min="-60" :max="-20" :step="1" />
+        </template>
         <div class="text-muted-foreground flex items-center justify-between gap-3 text-xs">
-          <span>Minimum silence length (s)</span>
+          <span>Minimum pause to remove (s)</span>
           <Input v-model.number="opts.silence_min_duration" type="number" min="0.3" max="5" step="0.1" class="h-7 w-20" />
         </div>
       </template>

@@ -670,11 +670,29 @@ pub struct NewUsage<'a> {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub price_per_minute: f64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+}
+
+/// Estimated (cost, saved) from audio minutes sent at a per-minute price.
+pub fn minute_cost(original_seconds: f64, sent_seconds: f64, price_per_minute: f64) -> (f64, f64) {
+    (
+        sent_seconds / 60.0 * price_per_minute,
+        (original_seconds - sent_seconds).max(0.0) / 60.0 * price_per_minute,
+    )
+}
+
+/// Estimated (cost, saved) from reported tokens. Only input (audio) tokens shrink when audio is
+/// condensed; output (text) tokens depend on what was said.
+pub fn token_cost(input: i64, output: i64, (pin, pout): (f64, f64), original_seconds: f64, sent_seconds: f64) -> (f64, f64) {
+    let input_cost = input as f64 * pin / 1e6;
+    let cost = input_cost + output as f64 * pout / 1e6;
+    let ratio = if sent_seconds > 0.0 { original_seconds / sent_seconds } else { 1.0 };
+    (cost, input_cost * (ratio - 1.0).max(0.0))
 }
 
 pub fn insert_usage(c: &Connection, u: &NewUsage) -> Result<()> {
-    let cost = u.sent_seconds / 60.0 * u.price_per_minute;
-    let saved = (u.original_seconds - u.sent_seconds).max(0.0) / 60.0 * u.price_per_minute;
+    let (cost, saved) = (u.cost_usd, u.saved_usd);
     c.execute(
         "INSERT INTO usage (transcript_id, title, provider, provider_name, model, status, original_seconds, sent_seconds,
            requests, input_tokens, output_tokens, price_per_minute, cost_usd, saved_usd, created_at)
@@ -894,8 +912,13 @@ mod tests {
             transcript_id: "t1", title: "Standup", provider: "groq", provider_name: "Groq", model: "m", status: "done",
             original_seconds: 600.0, sent_seconds: 240.0, requests: 1, input_tokens: 0, output_tokens: 0,
             price_per_minute: 0.006,
+            cost_usd: minute_cost(600.0, 240.0, 0.006).0,
+            saved_usd: minute_cost(600.0, 240.0, 0.006).1,
         };
         insert_usage(&c, &u).unwrap();
+        // 1 min of audio at 25 tok/s = 1500 input tokens; 2× condensed.
+        let (cost, saved) = token_cost(1500, 175, (2.0, 12.0), 120.0, 60.0);
+        assert!((cost - (0.003 + 0.0021)).abs() < 1e-9 && (saved - 0.003).abs() < 1e-9);
         let t = usage_for_transcript(&c, "t1").unwrap();
         assert!((t.cost_usd - 0.024).abs() < 1e-9 && (t.saved_usd - 0.036).abs() < 1e-9);
         let sum = usage_summary(&c).unwrap();

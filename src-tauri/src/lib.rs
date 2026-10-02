@@ -251,10 +251,17 @@ fn usage_summary(state: State<AppState>) -> CmdResult<db::UsageSummary> {
     db::usage_summary(&state.db.lock().unwrap()).map_err(err)
 }
 
-/// Built-in price estimate (USD/min) for a model, shown as the Settings placeholder.
+#[derive(serde::Serialize)]
+struct KnownPrice {
+    per_minute: f64,
+    /// USD per 1M input/output tokens, for token-billed models.
+    tokens: Option<(f64, f64)>,
+}
+
+/// Built-in price estimates for a model, shown as Settings placeholders.
 #[tauri::command]
-fn known_price(model: String) -> f64 {
-    settings::known_price(&model)
+fn known_price(model: String) -> KnownPrice {
+    KnownPrice { per_minute: settings::known_price(&model), tokens: settings::known_token_price(&model) }
 }
 
 // Folders & tags -------------------------------------------------------------------
