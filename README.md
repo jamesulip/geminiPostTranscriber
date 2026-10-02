@@ -1,7 +1,39 @@
-# Tauri + Vue + TypeScript
+# Transcriber
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+Desktop app (Tauri 2 + Vue 3 + shadcn-vue) to drop audio files and transcribe them with
+Groq / OpenAI (any OpenAI-compatible `/audio/transcriptions` API) or Gemini.
 
-## Recommended IDE Setup
+## Features
+- Drag & drop or upload audio/video files.
+- Cost reduction before upload: silence removal, speed-up (1–2×), Opus 24 kbps mono encoding.
+- Chunking at silence boundaries; timestamps are mapped back to the **original** audio.
+- Speaker diarization with Gemini `gemini-3.5-transcribe` (Interactions API) or OpenAI `gpt-4o-transcribe-diarize`.
+- Library grouped by nested **folders** and **tags**.
+- Transcript view: audio player, speaker timeline, click-to-seek, rename/reassign speakers, edit segments.
+- Full-text search across all transcripts (SQLite FTS5, ⌘K), in-transcript find.
+- Export TXT, Markdown, SRT, VTT, JSON.
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Setup
+```bash
+pnpm install
+./scripts/fetch-ffmpeg.sh   # downloads a static ffmpeg sidecar into src-tauri/binaries/
+pnpm tauri dev
+```
+Then open **Settings** and paste an API key for Groq, OpenAI, and/or Gemini.
+
+Data (SQLite library, copied audio, `settings.json`) lives in the app data dir,
+e.g. `~/Library/Application Support/ph.tigergraphics.transcriber/`. API keys are stored there in plain text.
+
+## Tests
+```bash
+cd src-tauri && cargo test
+# End-to-end against a local mock provider:
+python3 ../scripts/mock_openai_server.py &
+MOCK_URL=http://127.0.0.1:8765 MOCK_AUDIO=/path/to/audio.mp3 cargo test end_to_end -- --ignored --nocapture
+```
+
+## Notes / limitations
+- Whisper models (Groq, `whisper-1`) don't label speakers.
+- Gemini transcribe chunks are diarized independently; labels can drift between chunks, so the default Gemini
+  chunk is 25 min (diarized requests are capped at 30 min). Rename/reassign speakers in the transcript view.
+- Live transcription is not implemented.

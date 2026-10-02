@@ -353,4 +353,43 @@ mod tests {
         let c = plan_chunks(25.0, &[], 10.0);
         assert_eq!(c, vec![iv(0.0, 10.0), iv(10.0, 20.0), iv(20.0, 25.0)]);
     }
+
+    /// End-to-end: tones at known times survive silence removal + speedup and map back correctly.
+    #[tokio::test]
+    async fn pipeline_maps_back_to_original_time() {
+        let dir = std::env::temp_dir().join(format!("transcriber-audio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.wav");
+        let tones = [(2.0, 4.0), (10.0, 11.5), (20.0, 23.0)];
+        let cond = tones.iter().map(|(a, b)| format!("between(t,{a},{b})")).collect::<Vec<_>>().join("+");
+        let expr = format!("aevalsrc='if({cond},0.5*sin(2*PI*440*t),0)':s=16000:d=25");
+        ffmpeg(&["-y", "-f", "lavfi", "-i", &expr, src.to_str().unwrap()]).await.unwrap();
+
+        let opts = PreprocessOptions {
+            speed: 1.25,
+            remove_silence: true,
+            silence_threshold_db: -35.0,
+            silence_min_duration: 0.7,
+            chunk_seconds: 30.0,
+        };
+        let p = preprocess(&src, &dir.join("work"), &opts).await.unwrap();
+        assert!((p.original_duration - 25.0).abs() < 0.05);
+        // 6.5s of tone + padding, at 1.25x.
+        assert!(p.processed_duration < 7.0, "processed {}", p.processed_duration);
+
+        // Find tone onsets in the condensed audio and map them back.
+        let condensed = dir.join("work").join("condensed.wav");
+        let log = ffmpeg(&["-i", condensed.to_str().unwrap(), "-af", "silencedetect=noise=-40dB:d=0.05", "-f", "null", "-"])
+            .await
+            .unwrap();
+        let ends: Vec<f64> = parse_silences(&log, p.processed_duration).iter().map(|s| s.end).filter(|&e| e < p.processed_duration - 0.05).collect();
+        let onsets: Vec<f64> = ends.iter().map(|&t| p.map.to_original(t)).collect();
+        assert_eq!(onsets.len(), 3, "onsets {onsets:?}");
+        for (o, (a, _)) in onsets.iter().zip(tones) {
+            assert!((o - a).abs() < 0.06, "mapped {o} expected {a}");
+        }
+        assert_eq!(p.chunks.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
+

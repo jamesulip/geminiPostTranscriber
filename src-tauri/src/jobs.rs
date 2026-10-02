@@ -129,35 +129,41 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
     let language = o.language.as_deref().filter(|l| !l.trim().is_empty());
     let client = &state.http;
     let cfg = &job.provider;
-    let done = std::sync::atomic::AtomicUsize::new(0);
-    let report = |k: usize| {
+    let report = move |k: usize| {
         let p = 0.15 + 0.8 * (k as f64 / n as f64);
         emit(app, id, "transcribe", p, format!("Transcribed chunk {k}/{n}"));
     };
 
     let per_chunk: Vec<Vec<Segment>> = if providers::parallel(cfg) {
-        futures::stream::iter(prepared.chunks.iter())
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let futs: Vec<_> = prepared
+            .chunks
+            .iter()
+            .cloned()
             .map(|chunk| {
-                let done = &done;
+                let (client, cfg, cancel, done, app) =
+                    (client.clone(), cfg.clone(), job.cancel.clone(), done.clone(), app.clone());
+                let (language, id) = (language.map(str::to_string), id.to_string());
                 async move {
-                    if cancelled() {
+                    if cancel.load(Ordering::Relaxed) {
                         bail!("Cancelled");
                     }
                     let req = Request {
                         path: &chunk.path,
                         duration: chunk.duration,
-                        language,
+                        language: language.as_deref(),
                         known_speakers: &[],
                         previous_text: "",
                     };
-                    let segs = providers::transcribe(client, cfg, &req).await?;
-                    report(done.fetch_add(1, Ordering::Relaxed) + 1);
-                    Ok(segs)
+                    let segs = providers::transcribe(&client, &cfg, &req).await?;
+                    let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let p = 0.15 + 0.8 * (k as f64 / n as f64);
+                    emit(&app, &id, "transcribe", p, format!("Transcribed chunk {k}/{n}"));
+                    Ok::<_, anyhow::Error>(segs)
                 }
             })
-            .buffered(3)
-            .try_collect()
-            .await?
+            .collect();
+        futures::stream::iter(futs).buffered(3).try_collect().await?
     } else {
         // Sequential so each chunk can see the previous chunk's speakers and text.
         let mut all = Vec::with_capacity(n);
@@ -185,9 +191,18 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
 
     // Chunk-relative → processed → original time.
     emit(app, id, "merge", 0.97, "Merging");
-    let map = &prepared.map;
-    let mut merged: Vec<Segment> = prepared
-        .chunks
+    let merged = merge(&prepared.chunks, per_chunk, &prepared.map);
+    if merged.is_empty() {
+        bail!("The provider returned no speech");
+    }
+    let mut db = state.db.lock().unwrap();
+    db::replace_segments(&mut db, id, &merged)?;
+    Ok(())
+}
+
+/// Chunk-relative → processed → original time, sorted.
+pub fn merge(chunks: &[audio::Chunk], per_chunk: Vec<Vec<Segment>>, map: &audio::TimeMap) -> Vec<Segment> {
+    let mut merged: Vec<Segment> = chunks
         .iter()
         .zip(per_chunk)
         .flat_map(|(chunk, segs)| {
@@ -202,17 +217,40 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
     for s in &mut merged {
         s.end = s.end.max(s.start);
     }
-    if merged.is_empty() {
-        bail!("The provider returned no speech");
-    }
-    let mut db = state.db.lock().unwrap();
-    db::replace_segments(&mut db, id, &merged)?;
-    Ok(())
+    merged
 }
 
 pub fn chunk_minutes_default(kind: &ProviderKind, s: &crate::settings::Settings) -> f64 {
     match kind {
         ProviderKind::Gemini => s.gemini_chunk_minutes,
         ProviderKind::Openai => s.chunk_minutes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::ProviderKind;
+
+    /// Full path against a local mock server: `MOCK_URL=http://127.0.0.1:8765 MOCK_AUDIO=... cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn end_to_end_with_mock_provider() {
+        let url = std::env::var("MOCK_URL").unwrap();
+        let input = PathBuf::from(std::env::var("MOCK_AUDIO").unwrap());
+        let work = std::env::temp_dir().join(format!("tx-e2e-{}", uuid::Uuid::new_v4()));
+        let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds: 30.0 };
+        let prepared = audio::preprocess(&input, &work, &opts).await.unwrap();
+        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into() };
+        let client = reqwest::Client::new();
+        let mut per_chunk = vec![];
+        for c in &prepared.chunks {
+            let req = Request { path: &c.path, duration: c.duration, language: None, known_speakers: &[], previous_text: "" };
+            per_chunk.push(providers::transcribe(&client, &cfg, &req).await.unwrap());
+        }
+        let merged = merge(&prepared.chunks, per_chunk, &prepared.map);
+        println!("orig {:.2}s processed {:.2}s chunks {}", prepared.original_duration, prepared.processed_duration, prepared.chunks.len());
+        for s in &merged { println!("{:7.2} {:7.2} {}", s.start, s.end, s.text); }
+        let _ = std::fs::remove_dir_all(work);
     }
 }
