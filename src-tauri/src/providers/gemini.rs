@@ -1,7 +1,7 @@
 //! Gemini. `*-transcribe` models use the Interactions API (native diarization and word
 //! timestamps); other models fall back to `generateContent` with a JSON schema.
 
-use super::{check, parse_time, Request, Segment};
+use super::{check, extract_usage, parse_time, Request, Segment, Transcription};
 use crate::settings::ProviderConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 const MIME: &str = "audio/ogg";
 
-pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Vec<Segment>> {
+pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     if cfg.model.contains("transcribe") {
         transcribe_model(client, cfg, req).await
     } else {
@@ -26,7 +26,7 @@ fn base(cfg: &ProviderConfig) -> &str {
 // Interactions API (gemini-3.5-transcribe)
 // ---------------------------------------------------------------------------
 
-async fn transcribe_model(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Vec<Segment>> {
+async fn transcribe_model(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     let file = upload(client, cfg, req).await?;
     let result = interact(client, cfg, req, &file).await;
     // Best-effort cleanup; uploaded files otherwise expire after 48h.
@@ -101,7 +101,7 @@ async fn interact(
     cfg: &ProviderConfig,
     req: &Request<'_>,
     file: &UploadedFile,
-) -> Result<Vec<Segment>> {
+) -> Result<Transcription> {
     let mut transcription = json!({
         "mode": {
             "type": "verbatim",
@@ -143,7 +143,7 @@ async fn interact(
             .await?;
         v = check(r).await?.json().await?;
     }
-    Ok(parse_interaction(&v, req.duration))
+    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v) })
 }
 
 #[derive(Debug)]
@@ -248,7 +248,7 @@ fn group_words(words: Vec<Word>) -> Vec<Segment> {
 // generateContent fallback (general Gemini models)
 // ---------------------------------------------------------------------------
 
-async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Vec<Segment>> {
+async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     let bytes = tokio::fs::read(req.path).await?;
     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     let mut prompt = String::from(
@@ -301,7 +301,7 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
         .as_array()
         .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
         .unwrap_or_default();
-    parse_json_segments(&text)
+    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v) })
 }
 
 fn parse_json_segments(text: &str) -> Result<Vec<Segment>> {

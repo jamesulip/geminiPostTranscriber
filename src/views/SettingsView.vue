@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, reactive, ref, watchEffect } from "vue";
 import { Eye, EyeOff, Plus, Trash2 } from "@lucide/vue";
 import { toast } from "vue-sonner";
 import { Button } from "@/components/ui/button";
@@ -8,13 +8,33 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import type { Settings } from "@/lib/api";
+import { api, type Settings } from "@/lib/api";
 import { useSettings } from "@/stores/settings";
 
 const store = useSettings();
 const form = ref<Settings | null>(null);
 const reveal = ref<Record<string, boolean>>({});
 const BUILTIN = ["groq", "openai", "gemini"];
+// Built-in price estimate per provider, shown as the placeholder of the price field.
+const estimates = reactive<Record<string, number>>({});
+watchEffect(() => {
+  for (const p of form.value?.providers ?? []) {
+    const model = p.model;
+    void api.knownPrice(model).then((v) => (estimates[p.id] = v));
+  }
+});
+
+function priceModel(p: Settings["providers"][number]) {
+  return {
+    get value() {
+      return p.price_per_minute ?? "";
+    },
+    set value(v: string | number) {
+      const n = typeof v === "number" ? v : parseFloat(v);
+      p.price_per_minute = v === "" || Number.isNaN(n) ? null : n;
+    },
+  };
+}
 
 onMounted(async () => {
   form.value = JSON.parse(JSON.stringify(await store.load()));
@@ -28,6 +48,7 @@ function addProvider() {
     base_url: "http://localhost:8000/v1",
     api_key: "",
     model: "whisper-1",
+    price_per_minute: null,
   });
 }
 
@@ -84,6 +105,17 @@ async function save() {
                 </div>
                 <div class="grid gap-1.5"><Label>Base URL</Label><Input v-model="p.base_url" /></div>
                 <div class="grid gap-1.5"><Label>Default model</Label><Input v-model="p.model" /></div>
+                <div class="grid gap-1.5">
+                  <Label>Price per audio minute (USD)</Label>
+                  <Input
+                    :model-value="priceModel(p).value"
+                    type="number"
+                    min="0"
+                    step="0.0001"
+                    :placeholder="estimates[p.id] !== undefined ? `${estimates[p.id].toFixed(5)} (built-in estimate)` : ''"
+                    @update:model-value="(v) => (priceModel(p).value = v)"
+                  />
+                </div>
               </div>
             </div>
             <Button variant="outline" class="w-fit" @click="addProvider"><Plus /> Add OpenAI-compatible provider</Button>

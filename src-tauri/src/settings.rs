@@ -18,6 +18,31 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// USD per minute of audio sent. `None` → built-in estimate for known models.
+    #[serde(default)]
+    pub price_per_minute: Option<f64>,
+}
+
+/// Published list prices (USD per audio minute) for common models, used for estimates.
+pub fn known_price(model: &str) -> f64 {
+    let m = model.to_lowercase();
+    let table: &[(&str, f64)] = &[
+        ("whisper-large-v3-turbo", 0.04 / 60.0),
+        ("distil-whisper", 0.02 / 60.0),
+        ("whisper-large-v3", 0.111 / 60.0),
+        ("whisper-1", 0.006),
+        ("gpt-4o-mini-transcribe", 0.003),
+        ("gpt-4o-transcribe", 0.006),
+        ("gemini-3.5-transcribe", 0.005),
+        ("gemini", 0.002),
+    ];
+    table.iter().find(|(k, _)| m.contains(k)).map(|(_, p)| *p).unwrap_or(0.0)
+}
+
+impl ProviderConfig {
+    pub fn effective_price(&self) -> f64 {
+        self.price_per_minute.filter(|p| p.is_finite() && *p >= 0.0).unwrap_or_else(|| known_price(&self.model))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +72,7 @@ impl Default for Settings {
                     base_url: "https://api.groq.com/openai/v1".into(),
                     api_key: String::new(),
                     model: "whisper-large-v3-turbo".into(),
+                    price_per_minute: None,
                 },
                 ProviderConfig {
                     id: "openai".into(),
@@ -55,6 +81,7 @@ impl Default for Settings {
                     base_url: "https://api.openai.com/v1".into(),
                     api_key: String::new(),
                     model: "whisper-1".into(),
+                    price_per_minute: None,
                 },
                 ProviderConfig {
                     id: "gemini".into(),
@@ -63,6 +90,7 @@ impl Default for Settings {
                     base_url: "https://generativelanguage.googleapis.com".into(),
                     api_key: String::new(),
                     model: "gemini-3.5-transcribe".into(),
+                    price_per_minute: None,
                 },
             ],
             default_provider: "gemini".into(),
@@ -90,4 +118,18 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     }
     std::fs::write(path, serde_json::to_string_pretty(s)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_lookup_prefers_specific_models() {
+        assert!((known_price("whisper-large-v3-turbo") - 0.04 / 60.0).abs() < 1e-12);
+        assert!((known_price("whisper-large-v3") - 0.111 / 60.0).abs() < 1e-12);
+        assert_eq!(known_price("gpt-4o-transcribe-diarize"), 0.006);
+        assert_eq!(known_price("gpt-4o-mini-transcribe"), 0.003);
+        assert_eq!(known_price("my-local-model"), 0.0);
+    }
 }

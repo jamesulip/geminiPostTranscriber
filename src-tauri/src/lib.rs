@@ -207,6 +207,17 @@ fn export_transcript(state: State<AppState>, id: String, format: String, path: S
     std::fs::write(path, export::render(&t, &format)).map_err(err)
 }
 
+#[tauri::command]
+fn usage_summary(state: State<AppState>) -> CmdResult<db::UsageSummary> {
+    db::usage_summary(&state.db.lock().unwrap()).map_err(err)
+}
+
+/// Built-in price estimate (USD/min) for a model, shown as the Settings placeholder.
+#[tauri::command]
+fn known_price(model: String) -> f64 {
+    settings::known_price(&model)
+}
+
 // Folders & tags -------------------------------------------------------------------
 
 #[tauri::command]
@@ -282,6 +293,8 @@ pub fn run() {
             update_segment,
             search,
             export_transcript,
+            usage_summary,
+            known_price,
             list_folders,
             create_folder,
             rename_folder,

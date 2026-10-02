@@ -22,7 +22,7 @@ import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
 import PromptDialog from "@/components/PromptDialog.vue";
 import { api, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail } from "@/lib/api";
-import { formatDuration, formatTime, speakerColor } from "@/lib/format";
+import { formatDuration, formatTime, formatUsd, speakerColor } from "@/lib/format";
 import { highlightHtml } from "@/lib/highlight";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
 import { useJobs } from "@/stores/jobs";
@@ -307,6 +307,13 @@ const saved = computed(() =>
         <span class="text-muted-foreground ml-auto text-xs">
           {{ t.provider }} · {{ t.model }}
           <template v-if="saved !== null"> · {{ formatDuration(t.duration) }} → {{ formatDuration(t.processed_duration) }} sent ({{ saved }}% less)</template>
+          <template v-if="t.usage.jobs">
+            ·
+            <span
+              class="text-foreground font-medium"
+              :title="`${t.usage.jobs} job(s), ${t.usage.requests} request(s)` + (t.usage.input_tokens ? `, ${t.usage.input_tokens} in / ${t.usage.output_tokens} out tokens` : '') + ` · saved ${formatUsd(t.usage.saved_usd)}`"
+            >{{ formatUsd(t.usage.cost_usd) }}</span>
+          </template>
         </span>
       </div>
       <SpeakerTimeline

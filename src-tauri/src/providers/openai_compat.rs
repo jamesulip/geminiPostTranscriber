@@ -1,12 +1,12 @@
 //! OpenAI-compatible `/audio/transcriptions` (OpenAI, Groq, local servers, ...).
 
-use super::{check, parse_time, Request, Segment};
+use super::{check, extract_usage, parse_time, Request, Segment, Transcription};
 use crate::settings::ProviderConfig;
 use anyhow::{Context, Result};
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 
-pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Vec<Segment>> {
+pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     let bytes = tokio::fs::read(req.path).await?;
     let file = Part::bytes(bytes).file_name("audio.ogg").mime_str("audio/ogg")?;
     // `gpt-4o-transcribe-diarize` returns speaker-labelled segments; `gpt-4o-*` models
@@ -33,7 +33,7 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
     let resp = client.post(url).bearer_auth(&cfg.api_key).multipart(form).send().await?;
     let body: Value = check(resp).await?.json().await.context("invalid JSON from provider")?;
-    Ok(parse(&body, req.duration))
+    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body) })
 }
 
 fn parse(body: &Value, duration: f64) -> Vec<Segment> {

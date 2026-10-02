@@ -9,6 +9,8 @@ export interface ProviderConfig {
   base_url: string;
   api_key: string;
   model: string;
+  /** USD per audio minute; null = built-in estimate. */
+  price_per_minute: number | null;
 }
 
 export interface Settings {
@@ -67,11 +69,53 @@ export interface Speaker {
   display_name: string;
 }
 
+export interface UsageTotals {
+  jobs: number;
+  original_seconds: number;
+  sent_seconds: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  saved_usd: number;
+}
+
+export interface UsageGroup extends UsageTotals {
+  month: string;
+  provider_name: string;
+  model: string;
+}
+
+export interface UsageRow {
+  id: number;
+  transcript_id: string | null;
+  title: string;
+  provider_name: string;
+  model: string;
+  status: "done" | "error";
+  original_seconds: number;
+  sent_seconds: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  saved_usd: number;
+  created_at: string;
+}
+
+export interface UsageSummary {
+  all_time: UsageTotals;
+  this_month: UsageTotals;
+  by_month: UsageGroup[];
+  recent: UsageRow[];
+}
+
 export interface TranscriptDetail extends TranscriptSummary {
   audio_path: string;
   language: string | null;
   segments: SegmentRow[];
   speakers: Speaker[];
+  usage: UsageTotals;
 }
 
 export interface SearchHit {
@@ -135,6 +179,9 @@ export const api = {
   search: (query: string) => invoke<SearchHit[]>("search", { query }),
   exportTranscript: (id: string, format: ExportFormat, path: string) =>
     invoke<void>("export_transcript", { id, format, path }),
+
+  usageSummary: () => invoke<UsageSummary>("usage_summary"),
+  knownPrice: (model: string) => invoke<number>("known_price", { model }),
 
   listFolders: () => invoke<Folder[]>("list_folders"),
   createFolder: (name: string, parentId: number | null) => invoke<Folder>("create_folder", { name, parentId }),

@@ -1,7 +1,7 @@
 //! Background transcription jobs: preprocess → transcribe chunks → map times → store.
 
 use crate::audio::{self, PreprocessOptions};
-use crate::providers::{self, Request, Segment};
+use crate::providers::{self, Request, Segment, TokenUsage};
 use crate::settings::{ProviderConfig, ProviderKind};
 use crate::{db, AppState};
 use anyhow::{bail, Result};
@@ -9,7 +9,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,10 +56,29 @@ fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Int
     );
 }
 
+/// What was actually sent to the provider, for usage/cost accounting.
+#[derive(Default)]
+struct Meter {
+    /// original / processed duration, to attribute original minutes to sent chunks.
+    ratio: f64,
+    sent_seconds: f64,
+    requests: i64,
+    tokens: TokenUsage,
+}
+
+impl Meter {
+    fn add(&mut self, seconds: f64, tokens: TokenUsage) {
+        self.sent_seconds += seconds;
+        self.requests += 1;
+        self.tokens += tokens;
+    }
+}
+
 pub async fn run(app: AppHandle, job: Job) {
     let state = app.state::<AppState>();
     let work = state.cache_dir.join("jobs").join(&job.id);
-    let result = execute(&app, &job, &work).await;
+    let meter = Mutex::new(Meter::default());
+    let result = execute(&app, &job, &work, &meter).await;
     let _ = std::fs::remove_dir_all(&work);
     state.cancels.lock().unwrap().remove(&job.id);
 
@@ -68,6 +87,30 @@ pub async fn run(app: AppHandle, job: Job) {
         let db = state.db.lock().unwrap();
         let status = if error.is_some() { "error" } else { "done" };
         let _ = db::set_status(&db, &job.id, status, error.as_deref());
+        // Record whatever was billed, including partial work from failed/cancelled jobs.
+        let m = meter.lock().unwrap();
+        if m.requests > 0 {
+            let title: String = db
+                .query_row("SELECT title FROM transcripts WHERE id = ?1", [&job.id], |r| r.get(0))
+                .unwrap_or_default();
+            let _ = db::insert_usage(
+                &db,
+                &db::NewUsage {
+                    transcript_id: &job.id,
+                    title: &title,
+                    provider: &job.provider.id,
+                    provider_name: &job.provider.name,
+                    model: &job.provider.model,
+                    status,
+                    original_seconds: m.sent_seconds * m.ratio,
+                    sent_seconds: m.sent_seconds,
+                    requests: m.requests,
+                    input_tokens: m.tokens.input_tokens as i64,
+                    output_tokens: m.tokens.output_tokens as i64,
+                    price_per_minute: job.provider.effective_price(),
+                },
+            );
+        }
     }
     let _ = app.emit(
         "job-progress",
@@ -82,7 +125,7 @@ pub async fn run(app: AppHandle, job: Job) {
     );
 }
 
-async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<()> {
+async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mutex<Meter>) -> Result<()> {
     let state = app.state::<AppState>();
     let id = job.id.as_str();
     let cancelled = || job.cancel.load(Ordering::Relaxed);
@@ -113,6 +156,7 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
         let db = state.db.lock().unwrap();
         db::set_durations(&db, id, prepared.original_duration, prepared.processed_duration)?;
     }
+    meter.lock().unwrap().ratio = prepared.original_duration / prepared.processed_duration.max(0.001);
     let n = prepared.chunks.len();
     let saved = 100.0 * (1.0 - prepared.processed_duration / prepared.original_duration.max(0.001));
     emit(
@@ -155,7 +199,9 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
                         known_speakers: &[],
                         previous_text: "",
                     };
-                    let segs = providers::transcribe(&client, &cfg, &req).await?;
+                    let t = providers::transcribe(&client, &cfg, &req).await?;
+                    meter.lock().unwrap().add(chunk.duration, t.usage);
+                    let segs = t.segments;
                     let k = done.fetch_add(1, Ordering::Relaxed) + 1;
                     let p = 0.15 + 0.8 * (k as f64 / n as f64);
                     emit(&app, &id, "transcribe", p, format!("Transcribed chunk {k}/{n}"));
@@ -174,7 +220,9 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path) -> Result<(
                 bail!("Cancelled");
             }
             let req = Request { path: &chunk.path, duration: chunk.duration, language, known_speakers: &speakers, previous_text: &previous };
-            let segs = providers::transcribe(client, cfg, &req).await?;
+            let t = providers::transcribe(client, cfg, &req).await?;
+            meter.lock().unwrap().add(chunk.duration, t.usage);
+            let segs = t.segments;
             for s in &segs {
                 if let Some(sp) = &s.speaker {
                     if !speakers.contains(sp) {
@@ -241,12 +289,12 @@ mod tests {
         let work = std::env::temp_dir().join(format!("tx-e2e-{}", uuid::Uuid::new_v4()));
         let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds: 30.0 };
         let prepared = audio::preprocess(&input, &work, &opts).await.unwrap();
-        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into() };
+        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None };
         let client = reqwest::Client::new();
         let mut per_chunk = vec![];
         for c in &prepared.chunks {
             let req = Request { path: &c.path, duration: c.duration, language: None, known_speakers: &[], previous_text: "" };
-            per_chunk.push(providers::transcribe(&client, &cfg, &req).await.unwrap());
+            per_chunk.push(providers::transcribe(&client, &cfg, &req).await.unwrap().segments);
         }
         let merged = merge(&prepared.chunks, per_chunk, &prepared.map);
         println!("orig {:.2}s processed {:.2}s chunks {}", prepared.original_duration, prepared.processed_duration, prepared.chunks.len());

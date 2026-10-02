@@ -2,7 +2,7 @@
 import { ref } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import {
-  AudioLines, ChevronRight, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
+  AudioLines, ChartColumn, ChevronRight, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -165,7 +165,15 @@ async function upload() {
       </nav>
     </ScrollArea>
 
-    <div class="border-sidebar-border border-t p-3">
+    <div class="border-sidebar-border flex flex-col gap-0.5 border-t p-3">
+      <Button
+        variant="ghost"
+        class="w-full justify-start"
+        :class="route.name === 'usage' && 'bg-sidebar-accent'"
+        @click="router.push({ name: 'usage' })"
+      >
+        <ChartColumn /> Usage
+      </Button>
       <Button
         variant="ghost"
         class="w-full justify-start"

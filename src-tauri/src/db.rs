@@ -68,6 +68,28 @@ CREATE TABLE IF NOT EXISTS speakers (
   PRIMARY KEY (transcript_id, label)
 );
 
+-- One row per transcription job (kept when the transcript is deleted).
+CREATE TABLE IF NOT EXISTS usage (
+  id INTEGER PRIMARY KEY,
+  transcript_id TEXT REFERENCES transcripts(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  provider_name TEXT NOT NULL,
+  model TEXT NOT NULL,
+  status TEXT NOT NULL,
+  original_seconds REAL NOT NULL,
+  sent_seconds REAL NOT NULL,
+  requests INTEGER NOT NULL,
+  input_tokens INTEGER NOT NULL,
+  output_tokens INTEGER NOT NULL,
+  price_per_minute REAL NOT NULL,
+  cost_usd REAL NOT NULL,
+  saved_usd REAL NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_transcript ON usage(transcript_id);
+CREATE INDEX IF NOT EXISTS usage_created ON usage(created_at);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
   text, content='segments', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
 );
@@ -138,6 +160,7 @@ pub struct TranscriptDetail {
     pub language: Option<String>,
     pub segments: Vec<SegmentRow>,
     pub speakers: Vec<Speaker>,
+    pub usage: UsageTotals,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -304,7 +327,8 @@ pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetai
     let speakers = st
         .query_map([id], |r| Ok(Speaker { label: r.get(0)?, display_name: r.get(1)? }))?
         .collect::<Result<_, _>>()?;
-    Ok(Some(TranscriptDetail { summary, audio_path, language, segments, speakers }))
+    let usage = usage_for_transcript(c, id)?;
+    Ok(Some(TranscriptDetail { summary, audio_path, language, segments, speakers, usage }))
 }
 
 pub fn update_transcript(c: &Connection, id: &str, title: &str, folder_id: Option<i64>, tag_ids: &[i64]) -> Result<()> {
@@ -400,6 +424,153 @@ pub fn search(c: &Connection, q: &str, limit: i64) -> Result<Vec<SearchHit>> {
     Ok(hits)
 }
 
+// Usage ----------------------------------------------------------------------
+
+pub struct NewUsage<'a> {
+    pub transcript_id: &'a str,
+    pub title: &'a str,
+    pub provider: &'a str,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub status: &'a str,
+    pub original_seconds: f64,
+    pub sent_seconds: f64,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub price_per_minute: f64,
+}
+
+pub fn insert_usage(c: &Connection, u: &NewUsage) -> Result<()> {
+    let cost = u.sent_seconds / 60.0 * u.price_per_minute;
+    let saved = (u.original_seconds - u.sent_seconds).max(0.0) / 60.0 * u.price_per_minute;
+    c.execute(
+        "INSERT INTO usage (transcript_id, title, provider, provider_name, model, status, original_seconds, sent_seconds,
+           requests, input_tokens, output_tokens, price_per_minute, cost_usd, saved_usd, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            u.transcript_id, u.title, u.provider, u.provider_name, u.model, u.status, u.original_seconds,
+            u.sent_seconds, u.requests, u.input_tokens, u.output_tokens, u.price_per_minute, cost, saved,
+            chrono::Local::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct UsageTotals {
+    pub jobs: i64,
+    pub original_seconds: f64,
+    pub sent_seconds: f64,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+}
+
+const TOTALS_COLS: &str = "COUNT(*), COALESCE(SUM(original_seconds), 0), COALESCE(SUM(sent_seconds), 0),
+    COALESCE(SUM(requests), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+    COALESCE(SUM(cost_usd), 0), COALESCE(SUM(saved_usd), 0)";
+
+fn totals_from(r: &rusqlite::Row, at: usize) -> rusqlite::Result<UsageTotals> {
+    Ok(UsageTotals {
+        jobs: r.get(at)?,
+        original_seconds: r.get(at + 1)?,
+        sent_seconds: r.get(at + 2)?,
+        requests: r.get(at + 3)?,
+        input_tokens: r.get(at + 4)?,
+        output_tokens: r.get(at + 5)?,
+        cost_usd: r.get(at + 6)?,
+        saved_usd: r.get(at + 7)?,
+    })
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct UsageGroup {
+    pub month: String,
+    pub provider_name: String,
+    pub model: String,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct UsageRow {
+    pub id: i64,
+    pub transcript_id: Option<String>,
+    pub title: String,
+    pub provider_name: String,
+    pub model: String,
+    pub status: String,
+    pub original_seconds: f64,
+    pub sent_seconds: f64,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub saved_usd: f64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct UsageSummary {
+    pub all_time: UsageTotals,
+    pub this_month: UsageTotals,
+    pub by_month: Vec<UsageGroup>,
+    pub recent: Vec<UsageRow>,
+}
+
+pub fn usage_for_transcript(c: &Connection, id: &str) -> Result<UsageTotals> {
+    let sql = format!("SELECT {TOTALS_COLS} FROM usage WHERE transcript_id = ?1");
+    Ok(c.query_row(&sql, [id], |r| totals_from(r, 0))?)
+}
+
+pub fn usage_summary(c: &Connection) -> Result<UsageSummary> {
+    let all_time = c.query_row(&format!("SELECT {TOTALS_COLS} FROM usage"), [], |r| totals_from(r, 0))?;
+    let month = chrono::Local::now().format("%Y-%m").to_string();
+    let this_month = c.query_row(
+        &format!("SELECT {TOTALS_COLS} FROM usage WHERE substr(created_at, 1, 7) = ?1"),
+        [&month],
+        |r| totals_from(r, 0),
+    )?;
+    let mut st = c.prepare(&format!(
+        "SELECT substr(created_at, 1, 7) AS m, provider_name, model, {TOTALS_COLS} FROM usage
+         GROUP BY m, provider_name, model ORDER BY m DESC, SUM(cost_usd) DESC"
+    ))?;
+    let by_month = st
+        .query_map([], |r| {
+            Ok(UsageGroup { month: r.get(0)?, provider_name: r.get(1)?, model: r.get(2)?, totals: totals_from(r, 3)? })
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut st = c.prepare(
+        "SELECT id, transcript_id, title, provider_name, model, status, original_seconds, sent_seconds, requests,
+                input_tokens, output_tokens, cost_usd, saved_usd, created_at
+         FROM usage ORDER BY created_at DESC LIMIT 100",
+    )?;
+    let recent = st
+        .query_map([], |r| {
+            Ok(UsageRow {
+                id: r.get(0)?,
+                transcript_id: r.get(1)?,
+                title: r.get(2)?,
+                provider_name: r.get(3)?,
+                model: r.get(4)?,
+                status: r.get(5)?,
+                original_seconds: r.get(6)?,
+                sent_seconds: r.get(7)?,
+                requests: r.get(8)?,
+                input_tokens: r.get(9)?,
+                output_tokens: r.get(10)?,
+                cost_usd: r.get(11)?,
+                saved_usd: r.get(12)?,
+                created_at: r.get(13)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(UsageSummary { all_time, this_month, by_month, recent })
+}
+
 // Folders & tags ------------------------------------------------------------
 
 pub fn list_folders(c: &Connection) -> Result<Vec<Folder>> {
@@ -480,8 +651,25 @@ mod tests {
         let f = ListFilter { folder_id: None, tag_id: Some(tag.id), recursive: false };
         assert_eq!(list_transcripts(&c, &f).unwrap()[0].tags.len(), 1);
 
+        let u = NewUsage {
+            transcript_id: "t1", title: "Standup", provider: "groq", provider_name: "Groq", model: "m", status: "done",
+            original_seconds: 600.0, sent_seconds: 240.0, requests: 1, input_tokens: 0, output_tokens: 0,
+            price_per_minute: 0.006,
+        };
+        insert_usage(&c, &u).unwrap();
+        let t = usage_for_transcript(&c, "t1").unwrap();
+        assert!((t.cost_usd - 0.024).abs() < 1e-9 && (t.saved_usd - 0.036).abs() < 1e-9);
+        let sum = usage_summary(&c).unwrap();
+        assert_eq!((sum.all_time.jobs, sum.this_month.jobs, sum.by_month.len(), sum.recent.len()), (1, 1, 1, 1));
+
         rename_speaker(&c, "t1", "Speaker 1", "Alice").unwrap();
         assert_eq!(search(&c, "quarterly", 10).unwrap()[0].speaker.as_deref(), Some("Alice"));
+
+        // Usage history survives deleting the transcript.
+        delete_transcript(&c, "t1").unwrap();
+        let sum = usage_summary(&c).unwrap();
+        assert_eq!(sum.recent[0].transcript_id, None);
+        assert_eq!(sum.all_time.jobs, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

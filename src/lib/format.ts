@@ -34,3 +34,19 @@ export function isAudioPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return AUDIO_EXTENSIONS.includes(ext);
 }
+
+/** USD with enough precision for sub-cent amounts. */
+export function formatUsd(v: number): string {
+  if (!v) return "$0.00";
+  if (v < 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(2)}`;
+}
+
+export function formatMinutes(seconds: number): string {
+  const m = seconds / 60;
+  return m < 10 ? `${m.toFixed(1)} min` : `${Math.round(m).toLocaleString()} min`;
+}
+
+export function formatTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}

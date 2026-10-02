@@ -16,6 +16,51 @@ pub struct Segment {
     pub speaker: Option<String>,
 }
 
+/// Token counts if the provider reports them (0 otherwise).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, o: Self) {
+        self.input_tokens += o.input_tokens;
+        self.output_tokens += o.output_tokens;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Transcription {
+    pub segments: Vec<Segment>,
+    pub usage: TokenUsage,
+}
+
+/// Find a usage block in a provider response. Handles OpenAI (`usage.input_tokens`),
+/// Gemini generateContent (`usageMetadata.promptTokenCount`) and Interactions-style
+/// (`usage.total_input_tokens`) shapes.
+pub fn extract_usage(v: &serde_json::Value) -> TokenUsage {
+    fn find<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+        let m = v.as_object()?;
+        for key in ["usage", "usageMetadata", "usage_metadata"] {
+            if let Some(u) = m.get(key).and_then(|u| u.as_object()) {
+                return Some(u);
+            }
+        }
+        m.values().find_map(|c| match c {
+            serde_json::Value::Object(_) => find(c),
+            serde_json::Value::Array(a) => a.iter().find_map(find),
+            _ => None,
+        })
+    }
+    let Some(u) = find(v) else { return TokenUsage::default() };
+    let get = |keys: &[&str]| keys.iter().find_map(|k| u.get(*k).and_then(|x| x.as_u64())).unwrap_or(0);
+    TokenUsage {
+        input_tokens: get(&["input_tokens", "total_input_tokens", "promptTokenCount", "prompt_token_count"]),
+        output_tokens: get(&["output_tokens", "total_output_tokens", "candidatesTokenCount", "candidates_token_count"]),
+    }
+}
+
 pub struct Request<'a> {
     pub path: &'a Path,
     pub duration: f64,
@@ -31,7 +76,7 @@ pub fn parallel(cfg: &ProviderConfig) -> bool {
     cfg.kind == ProviderKind::Openai
 }
 
-pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Vec<Segment>> {
+pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     if cfg.api_key.trim().is_empty() {
         bail!("No API key set for {}. Add one in Settings.", cfg.name);
     }
@@ -46,7 +91,9 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
                 attempt += 1;
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
             }
-            other => return other.map(|segs| clamp(segs, req.duration)),
+            other => {
+                return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), usage: t.usage })
+            }
         }
     }
 }
@@ -118,5 +165,16 @@ mod tests {
         assert_eq!(parse_time(&json!("01:15.5")), Some(75.5));
         assert_eq!(parse_time(&json!("1:02:03")), Some(3723.0));
         assert_eq!(parse_time(&json!("abc")), None);
+    }
+
+    #[test]
+    fn extracts_usage_shapes() {
+        let o = extract_usage(&json!({"text": "x", "usage": {"type": "tokens", "input_tokens": 10, "output_tokens": 3}}));
+        assert_eq!(o, TokenUsage { input_tokens: 10, output_tokens: 3 });
+        let g = extract_usage(&json!({"candidates": [], "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2}}));
+        assert_eq!(g, TokenUsage { input_tokens: 7, output_tokens: 2 });
+        let i = extract_usage(&json!({"steps": [{"usage": {"total_input_tokens": 5, "total_output_tokens": 1}}]}));
+        assert_eq!(i, TokenUsage { input_tokens: 5, output_tokens: 1 });
+        assert_eq!(extract_usage(&json!({"text": "x", "duration": 3.0})), TokenUsage::default());
     }
 }
