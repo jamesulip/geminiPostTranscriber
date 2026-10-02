@@ -1,17 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { onClickOutside, refDebounced, useEventListener } from "@vueuse/core";
 import { useRoute, useRouter } from "vue-router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
   AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, PauseCircle, Play,
-  RefreshCw, RotateCcw, Search, Shrink, Trash2,
+  RefreshCw, RotateCcw, Search, Shrink, Trash2, Wrench,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
-import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
@@ -21,6 +21,8 @@ import FolderSelect from "@/components/FolderSelect.vue";
 import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
+import SegmentItem from "@/components/SegmentItem.vue";
+import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
 import PromptDialog from "@/components/PromptDialog.vue";
 import {
@@ -28,7 +30,6 @@ import {
 } from "@/lib/api";
 import { formatDate, formatDuration, formatLanguage, formatTime, formatUsd, speakerColor } from "@/lib/format";
 import { BREAK_SECONDS, findGaps, formatGap, type Gap } from "@/lib/breaks";
-import { highlightHtml } from "@/lib/highlight";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
 import { useJobs } from "@/stores/jobs";
 import { useLibrary } from "@/stores/library";
@@ -58,11 +59,28 @@ const collapseBreaks = ref(true);
 const versions = ref<VersionInfo[]>([]);
 const viewing = ref<VersionDetail | null>(null);
 
-const find = ref("");
+/** Typed text; `find` is its debounced value (keeps typing smooth in long transcripts). */
+const findInput = ref("");
+const find = refDebounced(findInput, 150);
 const onlyMatches = ref(false);
-const editing = ref<{ id: number; text: string } | null>(null);
+const editingId = ref<number | null>(null);
+const speakerMenu = ref<{ seg: SegmentRow; x: number; y: number } | null>(null);
+const speakerMenuEl = ref<HTMLElement | null>(null);
+onClickOutside(speakerMenuEl, () => (speakerMenu.value = null));
+useEventListener(window, "keydown", (e: KeyboardEvent) => e.key === "Escape" && (speakerMenu.value = null));
+
+function openSpeakerMenu(seg: SegmentRow, anchor: HTMLElement) {
+  const r = anchor.getBoundingClientRect();
+  speakerMenu.value = { seg, x: r.left, y: Math.min(r.bottom + 4, window.innerHeight - 260) };
+}
 const renaming = ref<string | null>(null);
 const retry = ref<JobOptions | null>(null);
+const fixing = ref(false);
+
+async function openFix() {
+  await settingsStore.load();
+  fixing.value = true;
+}
 
 const job = computed(() => jobs.progress[id.value]);
 
@@ -136,6 +154,25 @@ const rows = computed<Row[]>(() => {
   return out;
 });
 
+/** Render long transcripts progressively so the page opens instantly. */
+const RENDER_STEP = 400;
+const renderLimit = ref(RENDER_STEP);
+const visibleRows = computed(() => rows.value.slice(0, renderLimit.value));
+let growTimer: ReturnType<typeof setTimeout> | undefined;
+function growRows() {
+  clearTimeout(growTimer);
+  if (renderLimit.value >= rows.value.length) return;
+  renderLimit.value += RENDER_STEP;
+  growTimer = setTimeout(growRows, 30);
+}
+watch(() => rows.value.length, growRows, { immediate: true });
+
+/** Make sure a segment's row exists before scrolling to it. */
+function ensureRendered(segId: number) {
+  const i = rows.value.findIndex((r) => r.kind === "seg" && r.seg.id === segId);
+  if (i >= renderLimit.value) renderLimit.value = i + RENDER_STEP;
+}
+
 const activeId = computed(() => {
   const segs = segments.value;
   let found: SegmentRow | undefined;
@@ -147,7 +184,8 @@ const activeId = computed(() => {
 });
 watch(activeId, (sid) => {
   if (sid !== null && follow.value && playing.value) {
-    document.getElementById(`seg-${sid}`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    ensureRendered(sid);
+    void nextTick(() => document.getElementById(`seg-${sid}`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
   }
 });
 
@@ -155,6 +193,7 @@ function jumpFromQuery() {
   const tq = Number(route.query.t);
   if (!Number.isNaN(tq) && route.query.t !== undefined) {
     seek(tq, false);
+    ensureRendered(Number(route.query.seg));
     nextTick(() =>
       document.getElementById(`seg-${route.query.seg}`)?.scrollIntoView({ block: "center" }),
     );
@@ -208,23 +247,22 @@ async function renameSpeaker(name: string) {
   await load();
 }
 
-async function saveSegment() {
-  const e = editing.value;
-  if (!e || !t.value) return;
-  const seg = t.value.segments.find((s) => s.id === e.id);
-  editing.value = null;
-  if (!seg || seg.text === e.text.trim()) return;
-  await api.updateSegment(seg.id, e.text.trim(), seg.speaker);
-  seg.text = e.text.trim();
+async function saveSegment(seg: SegmentRow, text: string) {
+  editingId.value = null;
+  const next = text.trim();
+  if (!next || seg.text === next) return;
+  await api.updateSegment(seg.id, next, seg.speaker);
+  seg.text = next;
 }
 
 async function reassign(seg: SegmentRow, label: string) {
+  speakerMenu.value = null;
   await api.updateSegment(seg.id, seg.text, label);
   seg.speaker = label;
 }
 
 async function viewVersion(v: VersionInfo | null) {
-  editing.value = null;
+  editingId.value = null;
   viewing.value = v ? await api.getVersion(v.id) : null;
 }
 
@@ -260,10 +298,18 @@ async function doExport(format: ExportFormat) {
   }
 }
 
+/** True when the retry dialog was pre-filled from the failed job, so its finished chunks get reused. */
+const retryResumes = ref(false);
+
 async function openRetry() {
   const s = await settingsStore.load();
-  const o = defaultOptions(s, t.value?.provider);
-  retry.value = o;
+  const last = t.value?.last_options;
+  const fromLast = !!last && (t.value?.status !== "done" || !!t.value?.error);
+  retryResumes.value = fromLast;
+  // After a failure, reuse the exact same options so cached chunks match; otherwise start from defaults.
+  retry.value = fromLast
+    ? { ...defaultOptions(s, last!.provider_id ?? t.value?.provider), ...last, title: null, folder_id: null, tag_ids: [] }
+    : defaultOptions(s, t.value?.provider);
 }
 
 async function startRetry() {
@@ -350,7 +396,10 @@ const saved = computed(() =>
       <DropdownMenu>
         <DropdownMenuTrigger as-child><Button variant="ghost" size="icon"><MoreHorizontal /></Button></DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem :disabled="t.status === 'processing'" @click="openRetry"><RefreshCw /> Re-transcribe…</DropdownMenuItem>
+          <DropdownMenuItem :disabled="t.status === 'processing' || !t.segments.length || !!viewing" @click="openFix">
+            <Wrench /> Fix problems…
+          </DropdownMenuItem>
+          <DropdownMenuItem :disabled="t.status === 'processing'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
           <DropdownMenuItem v-if="t.status === 'processing'" @click="api.cancelJob(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" @click="remove"><Trash2 /> Delete</DropdownMenuItem>
@@ -377,6 +426,19 @@ const saved = computed(() =>
         <Button size="sm" variant="ghost" @click="deleteViewed"><Trash2 /> Delete</Button>
         <Button size="sm" variant="outline" @click="viewVersion(null)">Back to current</Button>
       </div>
+    </div>
+    <div
+      v-else-if="t.notes && t.status === 'done' && !t.error"
+      class="flex items-start gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm dark:border-amber-900 dark:bg-amber-950/40"
+    >
+      <AlertTriangle class="mt-0.5 size-4 shrink-0 text-amber-600" />
+      <div class="min-w-0">
+        <p>Some parts may be incomplete — the model still had problems after re-trying them in smaller pieces:</p>
+        <ul class="text-muted-foreground mt-0.5 list-disc pl-5 text-xs">
+          <li v-for="n in t.notes.split('\n')" :key="n">{{ n }}</li>
+        </ul>
+      </div>
+      <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="openFix"><Wrench /> Fix these parts</Button>
     </div>
     <div
       v-else-if="t.status === 'done' && t.error"
@@ -469,7 +531,7 @@ const saved = computed(() =>
       <div class="flex items-center gap-2 px-6 pt-4">
         <div class="relative w-72">
           <Search class="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
-          <Input v-model="find" placeholder="Find in transcript" class="h-8 pl-8" />
+          <Input v-model="findInput" placeholder="Find in transcript" class="h-8 pl-8" />
         </div>
         <template v-if="find.trim()">
           <span class="text-muted-foreground text-xs">{{ matches.size }} match(es)</span>
@@ -493,63 +555,70 @@ const saved = computed(() =>
       </div>
 
       <div class="min-h-0 flex-1 overflow-y-auto px-6 py-3">
-        <template v-for="row in rows" :key="row.kind === 'seg' ? row.seg.id : `gap-${row.gap.start}`">
-        <div
-          v-if="row.kind === 'break'"
-          class="text-muted-foreground my-2 flex items-center gap-3 px-2 text-xs"
-        >
-          <span class="h-px flex-1 border-t border-dashed" />
-          <button class="hover:text-primary flex items-center gap-1 tabular-nums" title="Jump to the end of the pause" @click="seek(row.gap.end)">
-            <PauseCircle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} pause · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}
-          </button>
-          <span class="h-px flex-1 border-t border-dashed" />
-        </div>
-        <div
-          v-else
-          v-for="s in [row.seg]"
-          :id="`seg-${s.id}`"
-          :key="s.id"
-          class="group grid grid-cols-[64px_120px_1fr] gap-3 rounded-lg px-2 py-1.5"
-          :class="s.id === activeId ? 'bg-primary/10' : 'hover:bg-accent/40'"
-        >
-          <button class="text-muted-foreground hover:text-primary pt-0.5 text-left text-xs tabular-nums" @click="seek(s.start)">
-            {{ formatTime(s.start) }}
-          </button>
-          <DropdownMenu>
-            <DropdownMenuTrigger as-child :disabled="readOnly">
-              <button class="flex h-fit items-center gap-1.5 truncate pt-0.5 text-left text-xs font-medium">
-                <span class="size-2 shrink-0 rounded-full" :style="{ backgroundColor: speakerColor(s.speaker, speakerOrder) }" />
-                <span class="truncate">{{ speakerName(s.speaker) }}</span>
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start">
-              <DropdownMenuLabel>Assign speaker</DropdownMenuLabel>
-              <DropdownMenuItem v-for="l in speakerOrder" :key="l" @click="reassign(s, l)">{{ speakerName(l) }}</DropdownMenuItem>
-              <DropdownMenuSeparator v-if="s.speaker" />
-              <DropdownMenuItem v-if="s.speaker" @click="renaming = s.speaker">Rename “{{ speakerName(s.speaker) }}”…</DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <Textarea
-            v-if="editing?.id === s.id"
-            v-model="editing.text"
-            autofocus
-            class="min-h-0 text-sm"
-            @blur="saveSegment"
-            @keydown.enter.exact.prevent="saveSegment"
-            @keydown.esc="editing = null"
-          />
-          <p
+        <template v-for="row in visibleRows" :key="row.kind === 'seg' ? row.seg.id : `gap-${row.gap.start}`">
+          <div v-if="row.kind === 'break'" class="text-muted-foreground my-2 flex items-center gap-3 px-2 text-xs">
+            <span class="h-px flex-1 border-t border-dashed" />
+            <button class="hover:text-primary flex items-center gap-1 tabular-nums" title="Jump to the end of the pause" @click="seek(row.gap.end)">
+              <PauseCircle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} pause · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}
+            </button>
+            <span class="h-px flex-1 border-t border-dashed" />
+          </div>
+          <SegmentItem
             v-else
-            class="cursor-text text-sm leading-relaxed"
-            :class="readOnly ? 'cursor-auto' : ''"
-            :title="readOnly ? '' : 'Double-click to edit'"
-            @dblclick="!readOnly && (editing = { id: s.id, text: s.text })"
-            v-html="highlightHtml(s.text, find)"
+            :seg="row.seg"
+            :speaker="speakerName(row.seg.speaker)"
+            :color="speakerColor(row.seg.speaker, speakerOrder)"
+            :active="row.seg.id === activeId"
+            :query="matches.has(row.seg.id) ? find : ''"
+            :read-only="readOnly"
+            :editing="editingId === row.seg.id"
+            @seek="seek"
+            @speaker-menu="openSpeakerMenu"
+            @edit="editingId = row.seg.id"
+            @save="(text) => saveSegment(row.seg, text)"
+            @cancel="editingId = null"
           />
-        </div>
         </template>
+        <p v-if="visibleRows.length < rows.length" class="text-muted-foreground py-4 text-center text-xs">
+          Loading {{ rows.length - visibleRows.length }} more…
+        </p>
       </div>
     </template>
+
+    <div
+      v-if="speakerMenu"
+      ref="speakerMenuEl"
+      class="bg-popover text-popover-foreground fixed z-50 min-w-44 rounded-lg border p-1 text-sm shadow-md"
+      :style="{ left: `${speakerMenu.x}px`, top: `${speakerMenu.y}px` }"
+    >
+      <p class="text-muted-foreground px-2 py-1.5 text-xs font-medium">Assign speaker</p>
+      <button
+        v-for="l in speakerOrder"
+        :key="l"
+        class="hover:bg-accent flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left"
+        @click="reassign(speakerMenu.seg, l)"
+      >
+        <span class="size-2 rounded-full" :style="{ backgroundColor: speakerColor(l, speakerOrder) }" />
+        {{ speakerName(l) }}
+        <Check v-if="speakerMenu.seg.speaker === l" class="ml-auto size-3.5" />
+      </button>
+      <template v-if="speakerMenu.seg.speaker">
+        <div class="bg-border -mx-1 my-1 h-px" />
+        <button
+          class="hover:bg-accent w-full rounded-md px-2 py-1.5 text-left"
+          @click="(renaming = speakerMenu.seg.speaker), (speakerMenu = null)"
+        >Rename “{{ speakerName(speakerMenu.seg.speaker) }}”…</button>
+      </template>
+    </div>
+
+    <FixProblemsDialog
+      v-if="fixing && settingsStore.settings"
+      :t="t"
+      :settings="settingsStore.settings"
+      @close="fixing = false"
+      @seek="(time) => seek(time, false)"
+      @started="(fixing = false), load(), library.refresh()"
+    />
 
     <PromptDialog
       v-if="renaming"
@@ -562,6 +631,10 @@ const saved = computed(() =>
     <Dialog :open="!!retry" @update:open="(o) => !o && (retry = null)">
       <DialogContent class="sm:max-w-lg">
         <DialogHeader><DialogTitle>Re-transcribe</DialogTitle></DialogHeader>
+        <p v-if="retryResumes" class="text-muted-foreground -mt-2 text-xs">
+          Same settings as the failed run, so chunks that already finished are reused (not re-sent or re-billed).
+          Changing provider, model, language, speed or silence settings starts over.
+        </p>
         <OptionsForm v-if="retry && settingsStore.settings" v-model="retry" :settings="settingsStore.settings" />
         <DialogFooter>
           <Button variant="ghost" @click="retry = null">Cancel</Button>

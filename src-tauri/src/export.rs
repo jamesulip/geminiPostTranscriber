@@ -15,7 +15,7 @@ fn stamp(t: f64, sep: char, hours: bool) -> String {
     }
 }
 
-fn clock(t: f64) -> String {
+pub fn clock(t: f64) -> String {
     let s = t as u64;
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{}:{:02}", s / 60, s % 60) }
 }

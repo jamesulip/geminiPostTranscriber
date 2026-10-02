@@ -70,3 +70,10 @@ export function formatLanguage(lang: string | null): string {
   }
   return l.charAt(0).toUpperCase() + l.slice(1);
 }
+
+/** "1:32:05", "32:05" or "95" → seconds; null if invalid. */
+export function parseClock(text: string): number | null {
+  const parts = text.trim().split(":");
+  if (!parts.length || parts.length > 3 || parts.some((p) => !/^\d+(\.\d+)?$/.test(p))) return null;
+  return parts.reduce((acc, p) => acc * 60 + Number(p), 0);
+}

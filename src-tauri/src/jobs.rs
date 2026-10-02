@@ -1,10 +1,11 @@
 //! Background transcription jobs: preprocess → transcribe chunks → map times → store.
 
 use crate::audio::{self, PreprocessOptions};
-use crate::providers::{self, Request, Segment, TokenUsage};
+use crate::providers::{self, Request, Segment, TokenUsage, Transcription};
 use crate::settings::{ProviderConfig, ProviderKind};
-use crate::{db, AppState};
+use crate::{db, quality, AppState};
 use anyhow::{bail, Result};
+use futures::future::{BoxFuture, FutureExt};
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobOptions {
     pub provider_id: String,
     pub model: Option<String>,
@@ -59,6 +60,8 @@ pub struct Job {
     pub provider: ProviderConfig,
     pub opts: JobOptions,
     pub cancel: Arc<AtomicBool>,
+    /// Re-transcribe only these stretches (original time) and splice them into the current version.
+    pub repair: Option<Vec<audio::Interval>>,
 }
 
 fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Into<String>) {
@@ -70,7 +73,7 @@ fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Int
 
 /// What was actually sent to the provider, for usage/cost accounting.
 #[derive(Default)]
-struct Meter {
+pub struct Meter {
     /// First language reported by the provider.
     language: Option<String>,
     /// original / processed duration, to attribute original minutes to sent chunks.
@@ -91,12 +94,60 @@ impl Meter {
     }
 }
 
+/// Finished chunk results kept on disk until the job succeeds, so a retry after a failure
+/// (rate limit, network, app closed) only re-sends the chunks that didn't finish.
+struct ChunkCache {
+    dir: PathBuf,
+    key: u64,
+}
+
+impl ChunkCache {
+    fn new(cache_dir: &std::path::Path, job: &Job) -> Self {
+        use std::hash::{Hash, Hasher};
+        let o = &job.opts;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&job.provider.id, &job.provider.model, o.language.as_deref().unwrap_or("")).hash(&mut h);
+        for v in [o.speed, o.silence_threshold_db, o.silence_min_duration, o.chunk_minutes, o.vad_threshold] {
+            v.to_bits().hash(&mut h);
+        }
+        (o.remove_silence, format!("{:?}", o.silence_method)).hash(&mut h);
+        std::fs::metadata(&job.audio_path).map(|m| m.len()).unwrap_or(0).hash(&mut h);
+        ChunkCache { dir: cache_dir.join("results").join(&job.id), key: h.finish() }
+    }
+
+    fn path(&self, i: usize, c: &audio::Chunk) -> PathBuf {
+        self.dir.join(format!("{:016x}-{i:04}-{:.3}-{:.3}.json", self.key, c.offset, c.duration))
+    }
+
+    fn get(&self, i: usize, c: &audio::Chunk) -> Option<Transcription> {
+        serde_json::from_str(&std::fs::read_to_string(self.path(i, c)).ok()?).ok()
+    }
+
+    fn put(&self, i: usize, c: &audio::Chunk, t: &Transcription) {
+        let _ = std::fs::create_dir_all(&self.dir);
+        if let Ok(json) = serde_json::to_string(t) {
+            let _ = std::fs::write(self.path(i, c), json);
+        }
+    }
+
+    fn clear(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 pub async fn run(app: AppHandle, job: Job) {
     let state = app.state::<AppState>();
     let work = state.cache_dir.join("jobs").join(&job.id);
     let meter = Mutex::new(Meter::default());
-    let result = execute(&app, &job, &work, &meter).await;
+    let cache = ChunkCache::new(&state.cache_dir, &job);
+    let result = match &job.repair {
+        Some(ranges) => execute_repair(&app, &job, &work, &meter, ranges).await,
+        None => execute(&app, &job, &work, &meter, &cache).await,
+    };
     let _ = std::fs::remove_dir_all(&work);
+    if result.is_ok() {
+        cache.clear();
+    }
     state.cancels.lock().unwrap().remove(&job.id);
 
     let error = result.err().map(|e| format!("{e:#}"));
@@ -155,7 +206,13 @@ pub async fn run(app: AppHandle, job: Job) {
     );
 }
 
-async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mutex<Meter>) -> Result<()> {
+async fn execute(
+    app: &AppHandle,
+    job: &Job,
+    work: &std::path::Path,
+    meter: &Mutex<Meter>,
+    cache: &ChunkCache,
+) -> Result<()> {
     let state = app.state::<AppState>();
     let id = job.id.as_str();
     let cancelled = || job.cancel.load(Ordering::Relaxed);
@@ -168,8 +225,9 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
         tokio::fs::copy(src, &job.audio_path).await?;
     }
 
-    emit(app, id, "preprocess", 0.05, "Removing silence and preparing chunks");
+    emit(app, id, "preprocess", 0.05, "Preparing audio");
     let o = &job.opts;
+    let on_progress = |msg: &str, f: f64| emit(app, id, "preprocess", 0.05 + 0.1 * f, msg);
     let prepared = audio::preprocess(
         &job.audio_path,
         work,
@@ -182,6 +240,7 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
             method: o.silence_method.clone(),
             vad_threshold: o.vad_threshold,
         },
+        &on_progress,
     )
     .await?;
     {
@@ -192,55 +251,70 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
     meter.lock().unwrap().ratio = prepared.original_duration / prepared.processed_duration.max(0.001);
     let n = prepared.chunks.len();
     let saved = 100.0 * (1.0 - prepared.processed_duration / prepared.original_duration.max(0.001));
+    let cached = prepared.chunks.iter().enumerate().filter(|(i, c)| cache.path(*i, c).exists()).count();
+    let resume = if cached > 0 { format!(" · resuming, {cached} already done") } else { String::new() };
     emit(
         app,
         id,
         "transcribe",
         0.15,
-        format!("Transcribing {n} chunk(s) · {saved:.0}% shorter than original"),
+        format!("Transcribing {n} chunk(s) · {saved:.0}% shorter than original{resume}"),
     );
     if cancelled() {
         bail!("Cancelled");
     }
 
     let language = o.language.as_deref().filter(|l| !l.trim().is_empty());
-    let client = &state.http;
-    let cfg = &job.provider;
-    let report = move |k: usize| {
-        let p = 0.15 + 0.8 * (k as f64 / n as f64);
-        emit(app, id, "transcribe", p, format!("Transcribed chunk {k}/{n}"));
+    let cut_points = prepared.map.boundaries();
+    let raw_dir = state.data_dir.join("raw").join(id);
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    std::fs::create_dir_all(&raw_dir)?;
+    let ctx = ChunkCtx {
+        client: &state.http,
+        cfg: &job.provider,
+        language,
+        condensed: &prepared.condensed,
+        cut_points: &cut_points,
+        work,
+        meter,
+        raw_dir: &raw_dir,
+        checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
+    };
+    let notes: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let progress_now = || 0.15 + 0.8 * (done.load(Ordering::Relaxed) as f64 / n as f64);
+
+    // One top-level chunk: cached result, or transcribe + check (+ split on problems).
+    let run_chunk = |i: usize, chunk: audio::Chunk, speakers: Vec<String>, previous: String| {
+        let (ctx, notes, done) = (&ctx, &notes, &done);
+        async move {
+            if job.cancel.load(Ordering::Relaxed) {
+                bail!("Cancelled");
+            }
+            let t = match cache.get(i, &chunk) {
+                Some(t) => t,
+                None => {
+                    let on_retry = |msg: String| emit(app, id, "transcribe", progress_now(), msg);
+                    let (t, problems) =
+                        transcribe_checked(ctx, chunk.clone(), (i + 1).to_string(), speakers, previous, &on_retry, 0).await?;
+                    notes.lock().unwrap().extend(problems);
+                    cache.put(i, &chunk, &t);
+                    t
+                }
+            };
+            let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+            emit(app, id, "transcribe", 0.15 + 0.8 * (k as f64 / n as f64), format!("Transcribed chunk {k}/{n}"));
+            Ok::<_, anyhow::Error>(t.segments)
+        }
     };
 
-    let per_chunk: Vec<Vec<Segment>> = if providers::parallel(cfg) {
-        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let per_chunk: Vec<Vec<Segment>> = if providers::parallel(&job.provider) {
         let futs: Vec<_> = prepared
             .chunks
             .iter()
             .cloned()
-            .map(|chunk| {
-                let (client, cfg, cancel, done, app) =
-                    (client.clone(), cfg.clone(), job.cancel.clone(), done.clone(), app.clone());
-                let (language, id) = (language.map(str::to_string), id.to_string());
-                async move {
-                    if cancel.load(Ordering::Relaxed) {
-                        bail!("Cancelled");
-                    }
-                    let req = Request {
-                        path: &chunk.path,
-                        duration: chunk.duration,
-                        language: language.as_deref(),
-                        known_speakers: &[],
-                        previous_text: "",
-                    };
-                    let t = providers::transcribe(&client, &cfg, &req).await?;
-                    meter.lock().unwrap().add(chunk.duration, t.usage, t.language);
-                    let segs = t.segments;
-                    let k = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    let p = 0.15 + 0.8 * (k as f64 / n as f64);
-                    emit(&app, &id, "transcribe", p, format!("Transcribed chunk {k}/{n}"));
-                    Ok::<_, anyhow::Error>(segs)
-                }
-            })
+            .enumerate()
+            .map(|(i, c)| run_chunk(i, c, Vec::new(), String::new()))
             .collect();
         futures::stream::iter(futs).buffered(3).try_collect().await?
     } else {
@@ -248,14 +322,8 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
         let mut all = Vec::with_capacity(n);
         let mut speakers: Vec<String> = Vec::new();
         let mut previous = String::new();
-        for (k, chunk) in prepared.chunks.iter().enumerate() {
-            if cancelled() {
-                bail!("Cancelled");
-            }
-            let req = Request { path: &chunk.path, duration: chunk.duration, language, known_speakers: &speakers, previous_text: &previous };
-            let t = providers::transcribe(client, cfg, &req).await?;
-            meter.lock().unwrap().add(chunk.duration, t.usage, t.language);
-            let segs = t.segments;
+        for (i, chunk) in prepared.chunks.iter().enumerate() {
+            let segs = run_chunk(i, chunk.clone(), speakers.clone(), previous.clone()).await?;
             for s in &segs {
                 if let Some(sp) = &s.speaker {
                     if !speakers.contains(sp) {
@@ -265,10 +333,10 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
             }
             previous = segs.iter().rev().take(4).rev().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
             all.push(segs);
-            report(k + 1);
         }
         all
     };
+    let notes = notes.into_inner().unwrap();
 
     // Chunk-relative → processed → original time.
     emit(app, id, "merge", 0.97, "Merging");
@@ -287,10 +355,242 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
             model: &job.provider.model,
             language: o.language.as_deref().filter(|l| !l.trim().is_empty()),
             detected_language: language.as_deref(),
+            notes: (!notes.is_empty()).then(|| notes.join("\n")),
             processed_duration: prepared.processed_duration,
         },
     )?;
     Ok(())
+}
+
+/// Re-transcribe only `ranges` of the original audio and splice the results into the current
+/// version (which is archived first, like any re-transcription).
+async fn execute_repair(
+    app: &AppHandle,
+    job: &Job,
+    work: &std::path::Path,
+    meter: &Mutex<Meter>,
+    ranges: &[audio::Interval],
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let id = job.id.as_str();
+    let o = &job.opts;
+    let current = {
+        let db = state.db.lock().unwrap();
+        db::get_transcript(&db, id)?.ok_or_else(|| anyhow::anyhow!("Transcript not found"))?
+    };
+    let total = current.summary.duration;
+    let language = o.language.as_deref().filter(|l| !l.trim().is_empty());
+    let raw_dir = state.data_dir.join("raw").join(id).join("repair");
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    std::fs::create_dir_all(&raw_dir)?;
+    std::fs::create_dir_all(work)?;
+
+    let n = ranges.len();
+    let (mut new_segs, mut notes) = (Vec::<Segment>::new(), Vec::<String>::new());
+    let (mut original_sum, mut processed_sum) = (0.0, 0.0);
+    for (r, range) in ranges.iter().enumerate() {
+        if job.cancel.load(Ordering::Relaxed) {
+            bail!("Cancelled");
+        }
+        let (a, b) = (range.start.max(0.0), range.end.min(total));
+        if b - a < 1.0 {
+            continue;
+        }
+        // A little extra audio on each side so words at the edges aren't cut; only text that
+        // starts inside [a, b) is used.
+        let (ca, cb) = ((a - 2.0).max(0.0), (b + 2.0).min(total));
+        let label = format!("{}/{n} ({}–{})", r + 1, crate::export::clock(a), crate::export::clock(b));
+        let base = 0.05 + 0.9 * r as f64 / n as f64;
+        emit(app, id, "transcribe", base, format!("Fixing part {label}"));
+
+        let slice = work.join(format!("range_{r}.wav"));
+        audio::extract_range(&job.audio_path, ca, cb - ca, &slice).await?;
+        let rwork = work.join(format!("range_{r}"));
+        let on_progress = |msg: &str, f: f64| emit(app, id, "preprocess", base + 0.1 * f / n as f64, format!("Part {label}: {msg}"));
+        let prepared = match audio::preprocess(&slice, &rwork, &preprocess_options(o), &on_progress).await {
+            Ok(p) => p,
+            Err(e) if e.to_string().starts_with("No speech found") => {
+                notes.push(format!("Part {label}: no speech found"));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        original_sum += prepared.original_duration;
+        processed_sum += prepared.processed_duration;
+        meter.lock().unwrap().ratio = original_sum / processed_sum.max(0.001);
+
+        let cut_points = prepared.map.boundaries();
+        let ctx = ChunkCtx {
+            client: &state.http,
+            cfg: &job.provider,
+            language,
+            condensed: &prepared.condensed,
+            cut_points: &cut_points,
+            work: &rwork,
+            meter,
+            raw_dir: &raw_dir,
+            checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
+        };
+        let on_retry = |msg: String| emit(app, id, "transcribe", base, format!("Part {label}: {msg}"));
+        let mut per_chunk = Vec::new();
+        let mut speakers: Vec<String> = Vec::new();
+        let mut previous = String::new();
+        for (i, chunk) in prepared.chunks.iter().enumerate() {
+            let (t, problems) = transcribe_checked(
+                &ctx, chunk.clone(), format!("r{}.{}", r + 1, i + 1), speakers.clone(), previous.clone(), &on_retry, 0,
+            )
+            .await?;
+            notes.extend(problems);
+            for s in t.segments.iter().filter_map(|s| s.speaker.clone()) {
+                if !speakers.contains(&s) {
+                    speakers.push(s);
+                }
+            }
+            previous = t.segments.iter().rev().take(4).rev().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+            per_chunk.push(t.segments);
+        }
+        new_segs.extend(
+            merge(&prepared.chunks, per_chunk, &prepared.map)
+                .into_iter()
+                .map(|s| Segment { start: s.start + ca, end: s.end + ca, ..s })
+                .filter(|s| s.start >= a && s.start < b),
+        );
+    }
+
+    // Keep everything outside the repaired stretches (minus impossible "lines"), add the new text.
+    emit(app, id, "merge", 0.97, "Merging");
+    let combined = splice(&current.segments, ranges, new_segs);
+
+    let detected = meter.lock().unwrap().language.clone();
+    let mut db = state.db.lock().unwrap();
+    db::commit_version_with_speakers(
+        &mut db,
+        id,
+        &combined,
+        &db::CompletedVersion {
+            provider: &job.provider.id,
+            model: &job.provider.model,
+            language: language.or(current.summary.language.as_deref()),
+            detected_language: detected.as_deref(),
+            notes: (!notes.is_empty()).then(|| notes.join("\n")),
+            processed_duration: current.summary.processed_duration,
+        },
+        &current.speakers,
+    )?;
+    Ok(())
+}
+
+/// Old segments outside `ranges` (minus impossible multi-minute "lines") + the new ones, sorted,
+/// with loops removed.
+pub fn splice(old: &[db::SegmentRow], ranges: &[audio::Interval], new: Vec<Segment>) -> Vec<Segment> {
+    let inside = |t: f64| ranges.iter().any(|r| t >= r.start && t < r.end);
+    let mut combined: Vec<Segment> = old
+        .iter()
+        .filter(|s| !inside(s.start) && s.end - s.start <= 120.0)
+        .map(|s| Segment { start: s.start, end: s.end, text: s.text.clone(), speaker: s.speaker.clone() })
+        .collect();
+    combined.extend(new.into_iter().filter(|s| inside(s.start)));
+    combined.sort_by(|a, b| a.start.total_cmp(&b.start));
+    quality::remove_loops(combined).0
+}
+
+fn preprocess_options(o: &JobOptions) -> PreprocessOptions {
+    PreprocessOptions {
+        speed: o.speed,
+        remove_silence: o.remove_silence,
+        silence_threshold_db: o.silence_threshold_db,
+        silence_min_duration: o.silence_min_duration,
+        chunk_seconds: o.chunk_minutes * 60.0,
+        method: o.silence_method.clone(),
+        vad_threshold: o.vad_threshold,
+    }
+}
+
+/// A chunk whose transcript fails the quality check is re-cut into halves this many times at most.
+const MAX_SPLIT_DEPTH: u32 = 2;
+/// Don't split chunks shorter than this.
+const MIN_SPLIT_SECS: f64 = 120.0;
+
+/// Everything needed to transcribe (and re-cut) chunks of one job.
+pub struct ChunkCtx<'a> {
+    pub client: &'a reqwest::Client,
+    pub cfg: &'a ProviderConfig,
+    pub language: Option<&'a str>,
+    pub condensed: &'a std::path::Path,
+    pub cut_points: &'a [f64],
+    pub work: &'a std::path::Path,
+    pub meter: &'a Mutex<Meter>,
+    /// Raw provider responses are saved here for diagnosing bad transcripts.
+    pub raw_dir: &'a std::path::Path,
+    pub checks: quality::CheckOptions,
+}
+
+/// Transcribe a chunk and check the result. On problems (skipped speech, loops, impossible timings,
+/// missing speakers) re-transcribe it as two halves, which long-audio failures usually fix.
+/// Returns the transcript (chunk-relative) and notes about problems that remained.
+pub fn transcribe_checked<'a>(
+    ctx: &'a ChunkCtx<'a>,
+    chunk: audio::Chunk,
+    label: String,
+    speakers: Vec<String>,
+    previous: String,
+    on_retry: &'a (dyn Fn(String) + Send + Sync),
+    depth: u32,
+) -> BoxFuture<'a, Result<(Transcription, Vec<String>)>> {
+    async move {
+        let req = Request {
+            path: &chunk.path,
+            duration: chunk.duration,
+            language: ctx.language,
+            known_speakers: &speakers,
+            previous_text: &previous,
+            on_retry,
+        };
+        let mut t = providers::transcribe(ctx.client, ctx.cfg, &req).await?;
+        ctx.meter.lock().unwrap().add(chunk.duration, t.usage, t.language.clone());
+        if let Some(raw) = t.raw.take() {
+            let _ = std::fs::write(ctx.raw_dir.join(format!("chunk-{label}.json")), raw.to_string());
+        }
+        let Some(problem) = quality::check(&t.segments, chunk.duration, &ctx.checks) else {
+            t.segments = quality::remove_loops(t.segments).0;
+            return Ok((t, Vec::new()));
+        };
+        if depth >= MAX_SPLIT_DEPTH || chunk.duration < MIN_SPLIT_SECS {
+            // Keep what we have, minus loops, and tell the user this part may be incomplete.
+            t.segments = quality::remove_loops(t.segments).0;
+            return Ok((t, vec![format!("Part {label} ({}): {problem}", span(&chunk))]));
+        }
+
+        on_retry(format!("Chunk {label}: {problem} — re-transcribing it in two halves"));
+        let mid = audio::split_point(ctx.cut_points, chunk.offset, chunk.offset + chunk.duration);
+        let end = chunk.offset + chunk.duration;
+        let a = audio::encode_chunk(ctx.condensed, chunk.offset, mid - chunk.offset, &ctx.work.join(format!("chunk_{label}a.ogg"))).await?;
+        let b = audio::encode_chunk(ctx.condensed, mid, end - mid, &ctx.work.join(format!("chunk_{label}b.ogg"))).await?;
+        let (ta, mut notes) =
+            transcribe_checked(ctx, a.clone(), format!("{label}a"), speakers.clone(), previous, on_retry, depth + 1).await?;
+        let mut more = speakers;
+        for s in ta.segments.iter().filter_map(|s| s.speaker.clone()) {
+            if !more.contains(&s) {
+                more.push(s);
+            }
+        }
+        let tail = ta.segments.iter().rev().take(4).rev().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        let (tb, nb) = transcribe_checked(ctx, b.clone(), format!("{label}b"), more, tail, on_retry, depth + 1).await?;
+        notes.extend(nb);
+
+        // Halves are relative to their own start; shift into this chunk's time.
+        let shift = b.offset - chunk.offset;
+        let mut segments = ta.segments;
+        segments.extend(tb.segments.into_iter().map(|s| Segment { start: s.start + shift, end: s.end + shift, ..s }));
+        let mut usage = ta.usage;
+        usage += tb.usage;
+        Ok((Transcription { segments, usage, language: ta.language.or(tb.language), raw: None }, notes))
+    }
+    .boxed()
+}
+
+fn span(c: &audio::Chunk) -> String {
+    format!("{:.0}–{:.0} min of sent audio", c.offset / 60.0, (c.offset + c.duration) / 60.0)
 }
 
 /// Chunk-relative → processed → original time, sorted.
@@ -325,6 +625,25 @@ mod tests {
     use super::*;
     use crate::settings::ProviderKind;
 
+    #[test]
+    fn splice_replaces_only_the_repaired_ranges() {
+        let row = |i: i64, a: f64, b: f64, t: &str| db::SegmentRow { id: i, idx: i, start: a, end: b, speaker: None, text: t.into() };
+        let old = vec![
+            row(1, 10.0, 12.0, "before"),
+            row(2, 100.0, 101.0, "loop line here"),
+            row(3, 100.0, 101.0, "loop line here"),
+            row(4, 150.0, 1900.0, "giant"),
+            row(5, 300.0, 302.0, "after"),
+        ];
+        let new = vec![
+            Segment { start: 95.0, end: 99.0, text: "outside, from the padding".into(), speaker: None },
+            Segment { start: 120.0, end: 125.0, text: "recovered speech".into(), speaker: Some("Speaker 1".into()) },
+        ];
+        let out = splice(&old, &[audio::Interval { start: 100.0, end: 200.0 }], new);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["before", "recovered speech", "after"]);
+    }
+
     /// Full path against a local mock server: `MOCK_URL=http://127.0.0.1:8765 MOCK_AUDIO=... cargo test -- --ignored`
     #[tokio::test]
     #[ignore]
@@ -332,15 +651,28 @@ mod tests {
         let url = std::env::var("MOCK_URL").unwrap();
         let input = PathBuf::from(std::env::var("MOCK_AUDIO").unwrap());
         let work = std::env::temp_dir().join(format!("tx-e2e-{}", uuid::Uuid::new_v4()));
-        let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds: 30.0, method: crate::settings::SilenceMethod::Speech, vad_threshold: 0.5 };
-        let prepared = audio::preprocess(&input, &work, &opts).await.unwrap();
+        let chunk_seconds = std::env::var("MOCK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);
+        let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds, method: crate::settings::SilenceMethod::Speech, vad_threshold: 0.5 };
+        let prepared = audio::preprocess(&input, &work, &opts, &|_, _| {}).await.unwrap();
         let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None };
         let client = reqwest::Client::new();
+        let meter = Mutex::new(Meter::default());
+        let cut_points = prepared.map.boundaries();
+        let raw_dir = work.join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        let ctx = ChunkCtx {
+            client: &client, cfg: &cfg, language: None, condensed: &prepared.condensed, cut_points: &cut_points,
+            work: &work, meter: &meter, raw_dir: &raw_dir,
+            checks: quality::CheckOptions { condensed: true, want_speakers: false },
+        };
+        let on_retry = |m: String| println!("{m}");
         let mut per_chunk = vec![];
-        for c in &prepared.chunks {
-            let req = Request { path: &c.path, duration: c.duration, language: None, known_speakers: &[], previous_text: "" };
-            per_chunk.push(providers::transcribe(&client, &cfg, &req).await.unwrap().segments);
+        for (i, c) in prepared.chunks.iter().enumerate() {
+            let (t, notes) = transcribe_checked(&ctx, c.clone(), (i + 1).to_string(), vec![], String::new(), &on_retry, 0).await.unwrap();
+            for n in notes { println!("note: {n}"); }
+            per_chunk.push(t.segments);
         }
+        println!("requests {}", meter.lock().unwrap().requests);
         let merged = merge(&prepared.chunks, per_chunk, &prepared.map);
         println!("orig {:.2}s processed {:.2}s chunks {}", prepared.original_duration, prepared.processed_duration, prepared.chunks.len());
         for s in &merged { println!("{:7.2} {:7.2} {}", s.start, s.end, s.text); }

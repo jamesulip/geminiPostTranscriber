@@ -78,6 +78,8 @@ export interface TranscriptSummary {
   version: number;
   /** When the current version was produced. */
   transcribed_at: string | null;
+  /** Parts of the current version that may be incomplete (one per line). */
+  notes: string | null;
 }
 
 /** An archived (non-current) transcription. */
@@ -154,6 +156,8 @@ export interface UsageSummary {
 
 export interface TranscriptDetail extends TranscriptSummary {
   audio_path: string;
+  /** Options of the most recent job (reused on retry so finished chunks aren't re-sent). */
+  last_options: Partial<JobOptions> | null;
   segments: SegmentRow[];
   speakers: Speaker[];
   usage: UsageTotals;
@@ -199,6 +203,15 @@ export interface ListFilter {
   recursive: boolean;
 }
 
+/** A stretch of a transcript that looks wrong. */
+export interface ProblemRange {
+  start: number;
+  end: number;
+  reasons: string[];
+  /** "text": missing or garbled text; "speakers": only speaker labels missing. */
+  kind: "text" | "speakers";
+}
+
 export type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 
 export const api = {
@@ -209,6 +222,9 @@ export const api = {
   startTranscription: (path: string, options: JobOptions) =>
     invoke<string>("start_transcription", { path, options }),
   retranscribe: (id: string, options: JobOptions) => invoke<void>("retranscribe", { id, options }),
+  findProblems: (id: string) => invoke<ProblemRange[]>("find_problems", { id }),
+  repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
+    invoke<void>("repair_transcript", { id, ranges, options }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
 
   listTranscripts: (filter: ListFilter) => invoke<TranscriptSummary[]>("list_transcripts", { filter }),

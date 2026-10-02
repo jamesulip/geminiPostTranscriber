@@ -30,12 +30,15 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transcription {
     pub segments: Vec<Segment>,
     pub usage: TokenUsage,
     /// Language detected by the provider, if reported (e.g. "english" or "en-US").
     pub language: Option<String>,
+    /// Raw provider response, saved for diagnosis (not cached).
+    #[serde(skip)]
+    pub raw: Option<serde_json::Value>,
 }
 
 /// Find a detected-language field anywhere in a response.
@@ -73,10 +76,28 @@ pub fn extract_usage(v: &serde_json::Value) -> TokenUsage {
     }
     let Some(u) = find(v) else { return TokenUsage::default() };
     let get = |keys: &[&str]| keys.iter().find_map(|k| u.get(*k).and_then(|x| x.as_u64())).unwrap_or(0);
-    TokenUsage {
-        input_tokens: get(&["input_tokens", "total_input_tokens", "promptTokenCount", "prompt_token_count"]),
-        output_tokens: get(&["output_tokens", "total_output_tokens", "candidatesTokenCount", "candidates_token_count"]),
+    // Interactions API: `*_tokens_by_modality: [{modality, tokens}]`.
+    let by_modality = |key: &str| -> u64 {
+        u.get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|m| m.get("tokens").or_else(|| m.get("token_count"))?.as_u64()).sum())
+            .unwrap_or(0)
+    };
+    let mut input = get(&["input_tokens", "total_input_tokens", "promptTokenCount", "prompt_token_count"]);
+    if input == 0 {
+        input = by_modality("input_tokens_by_modality");
     }
+    let mut output = get(&["output_tokens", "total_output_tokens", "candidatesTokenCount", "candidates_token_count"]);
+    if output == 0 {
+        output = by_modality("output_tokens_by_modality");
+    }
+    if output == 0 {
+        // Last resort: total minus input (and thinking/cached, which aren't billed as output here).
+        let total = get(&["total_tokens", "totalTokenCount", "total_token_count"]);
+        let other = get(&["total_thought_tokens", "thoughtsTokenCount"]) + get(&["total_cached_tokens", "cachedContentTokenCount"]);
+        output = total.saturating_sub(input + other);
+    }
+    TokenUsage { input_tokens: input, output_tokens: output }
 }
 
 pub struct Request<'a> {
@@ -86,7 +107,15 @@ pub struct Request<'a> {
     /// Speakers seen in earlier chunks, for prompt-based models.
     pub known_speakers: &'a [String],
     pub previous_text: &'a str,
+    /// Called with a status message when waiting before a retry (e.g. rate limits).
+    pub on_retry: &'a (dyn Fn(String) + Send + Sync),
 }
+
+/// Retries for server/network errors.
+const MAX_ATTEMPTS: u32 = 6;
+/// Rate limits on long recordings are expected; keep waiting as long as the provider asks,
+/// up to this much total waiting per chunk.
+const RATE_LIMIT_BUDGET_SECS: u64 = 45 * 60;
 
 /// Whether chunks can be sent concurrently. Gemini runs sequentially so speaker
 /// context from the previous chunk can be passed along.
@@ -99,15 +128,39 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
         bail!("No API key set for {}. Add one in Settings.", cfg.name);
     }
     let mut attempt = 0;
+    let mut waited = 0u64;
     loop {
         let res = match cfg.kind {
             ProviderKind::Openai => openai_compat::transcribe(client, cfg, req).await,
             ProviderKind::Gemini => gemini::transcribe(client, cfg, req).await,
         };
+        let http = res.as_ref().err().and_then(|e| e.downcast_ref::<HttpError>());
+        let rate_limited = http.is_some_and(|h| h.status == 429 && !h.daily);
+        let retry = match &res {
+            Err(_) if rate_limited => waited < RATE_LIMIT_BUDGET_SECS,
+            Err(e) => attempt + 1 < MAX_ATTEMPTS && is_retryable(e),
+            Ok(_) => false,
+        };
         match res {
-            Err(e) if attempt < 3 && is_retryable(&e) => {
+            Err(e) if retry => {
                 attempt += 1;
-                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                // Honour the provider's delay (Retry-After / RetryInfo), else back off exponentially.
+                let hinted = e.downcast_ref::<HttpError>().and_then(|h| h.retry_after);
+                let wait = hinted.unwrap_or(2u64.pow(attempt.min(8))).clamp(1, 300);
+                waited += wait;
+                // Outermost context names the step, e.g. "uploading audio" / "transcribing".
+                let step = if e.chain().count() > 1 { format!(" while {e}") } else { String::new() };
+                let why = match e.downcast_ref::<HttpError>() {
+                    Some(h) if h.status == 429 => match &h.quota {
+                        Some(q) => format!("{} quota reached{step}: {q}", cfg.name),
+                        None => format!("Rate limited by {}{step}", cfg.name),
+                    },
+                    Some(h) => format!("{} returned HTTP {}", cfg.name, h.status),
+                    None => format!("Network error talking to {}", cfg.name),
+                };
+                let tries = if rate_limited { format!("waited {}m so far", waited / 60) } else { format!("attempt {}/{MAX_ATTEMPTS}", attempt + 1) };
+                (req.on_retry)(format!("{why} — retrying in {wait}s ({tries})"));
+                tokio::time::sleep(Duration::from_secs(wait)).await;
             }
             other => {
                 return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), ..t })
@@ -120,10 +173,66 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
 pub struct HttpError {
     pub status: u16,
     pub body: String,
+    /// Seconds to wait, from the `Retry-After` header or Google's `RetryInfo.retryDelay`.
+    pub retry_after: Option<u64>,
+    /// Which quota was exceeded (Google `QuotaFailure`), e.g. "input tokens per minute (limit 250000)".
+    pub quota: Option<String>,
+    /// The quota resets daily: waiting a few minutes won't help.
+    pub daily: bool,
+}
+
+/// Pull retry delay and quota details out of a Google API error body.
+fn parse_google_error(body: &str) -> (Option<u64>, Option<String>, bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return (None, None, false) };
+    let details = v["error"]["details"].as_array().cloned().unwrap_or_default();
+    let mut retry = None;
+    let mut quota = None;
+    let mut daily = false;
+    for d in &details {
+        if let Some(delay) = d["retryDelay"].as_str() {
+            retry = delay.trim_end_matches('s').parse::<f64>().ok().map(|s| s.ceil() as u64);
+        }
+        if let Some(violation) = d["violations"].as_array().and_then(|a| a.first()) {
+            let id = violation["quotaId"].as_str().unwrap_or_default();
+            daily = id.contains("PerDay");
+            quota = Some(describe_quota(id, violation["quotaValue"].as_str()));
+        }
+    }
+    (retry, quota, daily)
+}
+
+/// "GenerateContentInputTokensPerModelPerMinute-FreeTier" → "input tokens per minute (free tier, limit 250000)"
+fn describe_quota(id: &str, value: Option<&str>) -> String {
+    let what = if id.contains("InputToken") {
+        "input tokens"
+    } else if id.contains("Token") {
+        "tokens"
+    } else if id.contains("Request") {
+        "requests"
+    } else {
+        "usage"
+    };
+    let per = if id.contains("PerDay") { "per day" } else if id.contains("PerMinute") { "per minute" } else { "" };
+    let tier = if id.contains("FreeTier") { "free tier, " } else { "" };
+    let limit = value.map(|v| format!("{tier}limit {v}")).unwrap_or_else(|| tier.trim_end_matches(", ").to_string());
+    let mut s = format!("{what} {per}").trim().to_string();
+    if !limit.is_empty() {
+        s.push_str(&format!(" ({limit})"));
+    }
+    s
 }
 
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.status == 429 {
+            let quota = self.quota.as_deref().map(|q| format!(" — quota: {q}")).unwrap_or_default();
+            let hint = if self.daily {
+                ". The daily quota resets tomorrow; finished chunks are saved, so retrying later resumes where it stopped"
+            } else {
+                ""
+            };
+            return write!(f, "Rate limited (HTTP 429){quota}{hint}");
+        }
         write!(f, "HTTP {}: {}", self.status, self.body.chars().take(500).collect::<String>())
     }
 }
@@ -131,7 +240,7 @@ impl std::error::Error for HttpError {}
 
 fn is_retryable(e: &anyhow::Error) -> bool {
     match e.downcast_ref::<HttpError>() {
-        Some(h) => h.status == 429 || h.status >= 500,
+        Some(h) => (h.status == 429 && !h.daily) || h.status >= 500,
         None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout() || r.is_connect()),
     }
 }
@@ -141,8 +250,15 @@ pub async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
     if status.is_success() {
         return Ok(resp);
     }
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|v| v.ceil() as u64);
     let body = resp.text().await.unwrap_or_default();
-    Err(HttpError { status: status.as_u16(), body }.into())
+    let (google_retry, quota, daily) = parse_google_error(&body);
+    Err(HttpError { status: status.as_u16(), body, retry_after: retry_after.or(google_retry), quota, daily }.into())
 }
 
 /// Models sometimes drift past the end of the audio; keep segments within bounds.
@@ -183,6 +299,33 @@ mod tests {
         assert_eq!(parse_time(&json!("01:15.5")), Some(75.5));
         assert_eq!(parse_time(&json!("1:02:03")), Some(3723.0));
         assert_eq!(parse_time(&json!("abc")), None);
+    }
+
+    #[test]
+    fn parses_google_rate_limit_errors() {
+        let body = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+            {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count","quotaId":"GenerateContentInputTokensPerModelPerMinute-FreeTier","quotaValue":"250000"}]},
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"55.6s"}]}}"#;
+        let (retry, quota, daily) = parse_google_error(body);
+        assert_eq!(retry, Some(56));
+        assert_eq!(quota.as_deref(), Some("input tokens per minute (free tier, limit 250000)"));
+        assert!(!daily);
+        let day = body.replace("GenerateContentInputTokensPerModelPerMinute", "GenerateRequestsPerDayPerProjectPerModel");
+        let (_, quota, daily) = parse_google_error(&day);
+        assert!(daily && quota.unwrap().starts_with("requests per day"));
+        let e: anyhow::Error = HttpError { status: 429, body: day, retry_after: None, quota: Some("requests per day".into()), daily: true }.into();
+        assert!(!is_retryable(&e));
+        assert!(e.to_string().contains("resumes where it stopped"));
+        assert_eq!(parse_google_error("not json"), (None, None, false));
+    }
+
+    #[test]
+    fn extracts_interaction_usage_fallbacks() {
+        let by_mod = extract_usage(&json!({"usage": {"input_tokens_by_modality": [{"modality": "audio", "tokens": 1500}],
+            "output_tokens_by_modality": [{"modality": "text", "tokens": 175}]}}));
+        assert_eq!(by_mod, TokenUsage { input_tokens: 1500, output_tokens: 175 });
+        let total = extract_usage(&json!({"usage": {"total_input_tokens": 1500, "total_tokens": 1700, "total_thought_tokens": 25}}));
+        assert_eq!(total.output_tokens, 175);
     }
 
     #[test]

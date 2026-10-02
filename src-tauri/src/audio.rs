@@ -4,6 +4,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -161,35 +163,116 @@ const SAMPLE_RATE: f64 = 16_000.0;
 /// earshot works on 16 ms frames at 16 kHz.
 const VAD_FRAME: usize = 256;
 
-/// Read 16-bit PCM samples from a WAV file (any chunk layout).
-pub fn read_wav_i16(path: &Path) -> Result<Vec<i16>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+/// Open a 16-bit mono PCM WAV and position the reader at the sample data.
+/// Returns the reader and the number of samples. Streams, so 6 h of audio doesn't need 700 MB of RAM.
+fn open_wav(path: &Path) -> Result<(BufReader<File>, u64)> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut r = BufReader::with_capacity(1 << 20, file);
+    let mut head = [0u8; 12];
+    r.read_exact(&mut head)?;
+    if &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
         bail!("not a WAV file");
     }
-    let mut pos = 12;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = pos + 8;
-        if id == b"data" {
-            // ffmpeg may write 0xFFFFFFFF for streamed output; clamp to the file.
-            let end = body.saturating_add(size).min(bytes.len());
-            return Ok(bytes[body..end].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect());
+    let mut pos = 12u64;
+    loop {
+        let mut ch = [0u8; 8];
+        r.read_exact(&mut ch).context("WAV file has no data chunk")?;
+        let size = u32::from_le_bytes(ch[4..8].try_into().unwrap()) as u64;
+        pos += 8;
+        if &ch[0..4] == b"data" {
+            // ffmpeg may write 0xFFFFFFFF for streamed output; trust the file length instead.
+            let bytes = size.min(file_len.saturating_sub(pos));
+            return Ok((r, bytes / 2));
         }
-        pos = body + size + (size & 1);
+        let skip = size + (size & 1);
+        r.seek_relative(skip as i64)?;
+        pos += skip;
     }
-    bail!("WAV file has no data chunk")
 }
 
-/// Stretches of speech according to the neural VAD. Runs shorter than 100 ms are ignored as clicks.
-pub fn speech_intervals(samples: &[i16], threshold: f32) -> Vec<Interval> {
+/// Call `f` with consecutive frames of `frame` samples (the last one may be shorter).
+fn for_each_frame(path: &Path, frame: usize, mut f: impl FnMut(&[i16])) -> Result<u64> {
+    let (mut r, total) = open_wav(path)?;
+    let mut bytes = vec![0u8; frame * 2];
+    let mut samples = vec![0i16; frame];
+    let mut left = total;
+    while left > 0 {
+        let n = (left as usize).min(frame);
+        r.read_exact(&mut bytes[..n * 2])?;
+        for (i, b) in bytes[..n * 2].chunks_exact(2).enumerate() {
+            samples[i] = i16::from_le_bytes([b[0], b[1]]);
+        }
+        f(&samples[..n]);
+        left -= n as u64;
+    }
+    Ok(total)
+}
+
+fn wav_header(samples: u64) -> [u8; 44] {
+    let data = (samples * 2).min(u32::MAX as u64 - 36) as u32;
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36 + data).to_le_bytes());
+    h[8..16].copy_from_slice(b"WAVEfmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&1u16.to_le_bytes()); // mono
+    h[24..28].copy_from_slice(&16_000u32.to_le_bytes());
+    h[28..32].copy_from_slice(&32_000u32.to_le_bytes());
+    h[32..34].copy_from_slice(&2u16.to_le_bytes());
+    h[34..36].copy_from_slice(&16u16.to_le_bytes());
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data.to_le_bytes());
+    h
+}
+
+/// Copy only the kept sample ranges of a 16 kHz mono WAV into a new WAV (sample-exact).
+pub fn condense_wav(input: &Path, output: &Path, keeps: &[Interval]) -> Result<()> {
+    let ranges: Vec<(u64, u64)> =
+        keeps.iter().map(|k| ((k.start * SAMPLE_RATE).round() as u64, (k.end * SAMPLE_RATE).round() as u64)).collect();
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(output)?);
+    w.write_all(&wav_header(0))?;
+    let (mut written, mut idx, mut ri) = (0u64, 0u64, 0usize);
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
+    for_each_frame(input, 1 << 15, |frame| {
+        let (start, end) = (idx, idx + frame.len() as u64);
+        buf.clear();
+        while ri < ranges.len() && ranges[ri].0 < end {
+            let (a, b) = ranges[ri];
+            let (from, to) = (a.max(start), b.min(end));
+            if from < to {
+                for s in &frame[(from - start) as usize..(to - start) as usize] {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
+                written += to - from;
+            }
+            if b <= end {
+                ri += 1;
+            } else {
+                break;
+            }
+        }
+        let _ = w.write_all(&buf);
+        idx = end;
+    })?;
+    w.flush()?;
+    let mut f = w.into_inner().map_err(|e| anyhow!("{e}"))?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&wav_header(written))?;
+    Ok(())
+}
+
+/// Stretches of speech according to the neural VAD, streamed from a 16 kHz mono WAV.
+/// Runs shorter than 100 ms are ignored as clicks. Returns (speech, total seconds).
+pub fn speech_intervals(path: &Path, threshold: f32) -> Result<(Vec<Interval>, f64)> {
     let mut detector = earshot::Detector::default();
     let frame_secs = VAD_FRAME as f64 / SAMPLE_RATE;
     let mut out = Vec::new();
     let mut start: Option<f64> = None;
     let mut frame = [0i16; VAD_FRAME];
-    for (i, chunk) in samples.chunks(VAD_FRAME).enumerate() {
+    let mut i = 0usize;
+    let total = for_each_frame(path, VAD_FRAME, |chunk| {
         frame[..chunk.len()].copy_from_slice(chunk);
         frame[chunk.len()..].fill(0);
         let t = i as f64 * frame_secs;
@@ -202,12 +285,14 @@ pub fn speech_intervals(samples: &[i16], threshold: f32) -> Vec<Interval> {
             }
             _ => {}
         }
-    }
+        i += 1;
+    })? as f64
+        / SAMPLE_RATE;
     if let Some(s) = start {
-        out.push(Interval { start: s, end: samples.len() as f64 / SAMPLE_RATE });
+        out.push(Interval { start: s, end: total });
     }
     out.retain(|i| i.end - i.start >= 0.1);
-    out
+    Ok((out, total))
 }
 
 /// Gaps between speech of at least `min_silence` seconds, in the same shape as `parse_silences`.
@@ -298,9 +383,54 @@ pub struct Prepared {
     pub map: TimeMap,
     pub chunks: Vec<Chunk>,
     pub recorded_at: Option<String>,
+    /// The condensed (silence-removed, sped-up) WAV, kept so problem chunks can be re-cut.
+    pub condensed: PathBuf,
 }
 
-pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> Result<Prepared> {
+/// Encode `[start, start + duration)` of the condensed WAV as a small Opus chunk.
+pub async fn encode_chunk(condensed: &Path, start: f64, duration: f64, out: &Path) -> Result<Chunk> {
+    let (ss, t) = (format!("{start:.3}"), format!("{duration:.3}"));
+    let (src, dst) = (condensed.to_string_lossy().to_string(), out.to_string_lossy().to_string());
+    ffmpeg(&[
+        "-y", "-ss", &ss, "-t", &t, "-i", &src, "-ac", "1", "-c:a", "libopus", "-b:a", "24k", "-application", "voip", &dst,
+    ])
+    .await?;
+    Ok(Chunk { path: out.to_path_buf(), offset: start, duration })
+}
+
+/// Cut `[start, start + duration)` of any audio file into a 16 kHz mono WAV.
+pub async fn extract_range(input: &Path, start: f64, duration: f64, out: &Path) -> Result<()> {
+    let (ss, t) = (format!("{start:.3}"), format!("{duration:.3}"));
+    let (src, dst) = (input.to_string_lossy().to_string(), out.to_string_lossy().to_string());
+    ffmpeg(&["-y", "-ss", &ss, "-t", &t, "-i", &src, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", &dst]).await?;
+    Ok(())
+}
+
+/// Seconds of speech (VAD) in `[start, start + duration)` of an audio file.
+pub async fn speech_seconds(input: &Path, start: f64, duration: f64, scratch: &Path) -> Result<f64> {
+    extract_range(input, start, duration, scratch).await?;
+    let path = scratch.to_path_buf();
+    let speech = tokio::task::spawn_blocking(move || speech_intervals(&path, 0.5)).await??.0;
+    let _ = std::fs::remove_file(scratch);
+    Ok(speech.iter().map(|i| i.end - i.start).sum())
+}
+
+/// Where to split `[start, end)` in two: the cut point nearest the middle, else the middle.
+pub fn split_point(cut_points: &[f64], start: f64, end: f64) -> f64 {
+    let mid = (start + end) / 2.0;
+    let (lo, hi) = (start + (end - start) * 0.25, end - (end - start) * 0.25);
+    cut_points
+        .iter()
+        .copied()
+        .filter(|&c| c > lo && c < hi)
+        .min_by(|a, b| (a - mid).abs().total_cmp(&(b - mid).abs()))
+        .unwrap_or(mid)
+}
+
+/// Progress callback: (message, 0..1 within preprocessing).
+pub type OnProgress<'a> = &'a (dyn Fn(&str, f64) + Send + Sync);
+
+pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions, progress: OnProgress<'_>) -> Result<Prepared> {
     std::fs::create_dir_all(work)?;
     let speed = opts.speed.clamp(0.5, 2.0);
     let norm = work.join("norm.wav");
@@ -308,19 +438,20 @@ pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> 
     let input_s = input.to_string_lossy().to_string();
 
     // 1. Normalize to 16 kHz mono PCM.
+    progress("Converting audio", 0.0);
     let probe = ffmpeg(&["-y", "-i", &input_s, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", &norm_s]).await?;
     // Only look at the input section, not the output's metadata.
     let recorded_at = parse_creation_time(probe.split("Output #0").next().unwrap_or(&probe));
 
+    progress(if opts.method == SilenceMethod::Speech { "Detecting speech" } else { "Detecting silence" }, 0.3);
     // 2. Find what to drop: non-speech (neural VAD) or quiet stretches (volume threshold).
     let (total, silences, pad) = match opts.method {
         SilenceMethod::Speech => {
             let (path, th, min) = (norm.clone(), opts.vad_threshold as f32, opts.silence_min_duration);
             tokio::task::spawn_blocking(move || -> Result<(f64, Vec<Interval>, f64)> {
-                let samples = read_wav_i16(&path)?;
-                let total = samples.len() as f64 / SAMPLE_RATE;
+                let (speech, total) = speech_intervals(&path, th)?;
                 // Slightly larger padding: VAD edges can clip soft word onsets.
-                Ok((total, non_speech(&speech_intervals(&samples, th), total, min), 0.25))
+                Ok((total, non_speech(&speech, total, min), 0.25))
             })
             .await??
         }
@@ -352,59 +483,60 @@ pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> 
     if keeps.is_empty() {
         bail!("No speech found in the audio. Try the volume-based silence method or a lower speech threshold.");
     }
-    let map = TimeMap::new(&keeps, speed);
 
-    // 3. Condense: select kept ranges (10 ms frames for precision) and apply tempo.
+    // 3. Condense: copy kept ranges in Rust (exact, streams), then speed up with ffmpeg.
+    progress("Removing silence and speeding up", 0.55);
     let needs_trim = keeps.len() > 1 || keeps[0].start > 0.0 || keeps[0].end < total;
-    let condensed = if needs_trim || (speed - 1.0).abs() > 1e-3 {
-        let mut filters = vec!["asetnsamples=n=160".to_string()];
-        if needs_trim {
-            let expr = keeps
-                .iter()
-                .map(|k| format!("gte(t,{:.4})*lt(t,{:.4})", k.start - 0.001, k.end - 0.001))
-                .collect::<Vec<_>>()
-                .join("+");
-            filters.push(format!("aselect='{expr}'"));
-            filters.push("asetpts=N/SR/TB".into());
-        }
-        if (speed - 1.0).abs() > 1e-3 {
-            filters.push(format!("atempo={speed:.3}"));
-        }
-        let script = work.join("filter.txt");
-        std::fs::write(&script, filters.join(","))?;
-        let out = work.join("condensed.wav");
-        let out_s = out.to_string_lossy().to_string();
-        let script_s = script.to_string_lossy().to_string();
-        ffmpeg(&["-y", "-i", &norm_s, "-/af", &script_s, "-c:a", "pcm_s16le", &out_s]).await?;
+    let trimmed = if needs_trim {
+        let out = work.join("trimmed.wav");
+        let (src, dst, k) = (norm.clone(), out.clone(), keeps.clone());
+        tokio::task::spawn_blocking(move || condense_wav(&src, &dst, &k)).await??;
         out
     } else {
         norm.clone()
     };
+    let condensed = if (speed - 1.0).abs() > 1e-3 {
+        let out = work.join("condensed.wav");
+        let (in_s, out_s) = (trimmed.to_string_lossy().to_string(), out.to_string_lossy().to_string());
+        ffmpeg(&["-y", "-i", &in_s, "-af", &format!("atempo={speed:.3}"), "-c:a", "pcm_s16le", &out_s]).await?;
+        out
+    } else {
+        trimmed
+    };
+    // atempo's output length can differ very slightly from nominal; calibrate the time map to the
+    // real sample counts so timestamps don't drift over multi-hour recordings.
+    let effective_speed = if (speed - 1.0).abs() > 1e-3 {
+        let kept: f64 = keeps.iter().map(|k| ((k.end - k.start) * SAMPLE_RATE).round()).sum();
+        let actual = open_wav(&condensed)?.1 as f64;
+        if actual > 0.0 { (kept / actual).clamp(speed * 0.98, speed * 1.02) } else { speed }
+    } else {
+        1.0
+    };
+    let map = TimeMap::new(&keeps, effective_speed);
     let processed_duration = map.processed_duration();
 
     // 4. Chunk at silence boundaries.
     let cut_points: Vec<f64> = if opts.remove_silence {
         map.boundaries()
     } else {
-        silences.iter().map(|s| (s.start + s.end) / 2.0 / speed).collect()
+        silences.iter().map(|s| (s.start + s.end) / 2.0 / effective_speed).collect()
     };
     let plan = plan_chunks(processed_duration, &cut_points, opts.chunk_seconds.max(30.0));
-    let condensed_s = condensed.to_string_lossy().to_string();
     let mut chunks = Vec::new();
     for (i, c) in plan.iter().enumerate() {
-        let path = work.join(format!("chunk_{i:03}.ogg"));
-        let path_s = path.to_string_lossy().to_string();
-        let ss = format!("{:.3}", c.start);
-        let t = format!("{:.3}", c.end - c.start);
-        ffmpeg(&[
-            "-y", "-ss", &ss, "-t", &t, "-i", &condensed_s, "-ac", "1", "-c:a", "libopus", "-b:a", "24k",
-            "-application", "voip", &path_s,
-        ])
-        .await?;
-        chunks.push(Chunk { path, offset: c.start, duration: c.end - c.start });
+        progress(&format!("Encoding chunk {}/{}", i + 1, plan.len()), 0.7 + 0.3 * i as f64 / plan.len() as f64);
+        chunks.push(encode_chunk(&condensed, c.start, c.end - c.start, &work.join(format!("chunk_{i:03}.ogg"))).await?);
     }
 
-    Ok(Prepared { original_duration: total, processed_duration, map, chunks, recorded_at })
+    // The intermediate WAVs are ~115 MB per hour each. Keep only the condensed one (needed to re-cut
+    // problem chunks); the job's work dir is removed when it finishes.
+    for f in ["norm.wav", "trimmed.wav"] {
+        let p = work.join(f);
+        if p != condensed && !cfg!(test) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    Ok(Prepared { original_duration: total, processed_duration, map, chunks, recorded_at, condensed })
 }
 
 #[cfg(test)]
@@ -484,7 +616,7 @@ mod tests {
             method: SilenceMethod::Volume,
             vad_threshold: 0.5,
         };
-        let p = preprocess(&src, &dir.join("work"), &opts).await.unwrap();
+        let p = preprocess(&src, &dir.join("work"), &opts, &|_, _| {}).await.unwrap();
         assert!((p.original_duration - 25.0).abs() < 0.05);
         // 6.5s of tone + padding, at 1.25x.
         assert!(p.processed_duration < 7.0, "processed {}", p.processed_duration);
@@ -540,7 +672,7 @@ mod tests {
                     speed: 1.0, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7,
                     chunk_seconds: 600.0, method, vad_threshold: 0.5,
                 };
-                preprocess(&src, &work, &opts).await.unwrap()
+                preprocess(&src, &work, &opts, &|_, _| {}).await.unwrap()
             }
         };
         let volume = run(SilenceMethod::Volume).await;
@@ -555,6 +687,27 @@ mod tests {
         let first = speech.map.pieces[0].original_start;
         assert!((first - 3.0).abs() < 0.5, "first speech kept from {first}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Timing check for long recordings: `BENCH_AUDIO=/path/long.mp3 cargo test bench_preprocess -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_preprocess() {
+        let input = PathBuf::from(std::env::var("BENCH_AUDIO").unwrap());
+        for method in [SilenceMethod::Speech, SilenceMethod::Volume] {
+            let work = std::env::temp_dir().join(format!("transcriber-bench-{}", uuid::Uuid::new_v4()));
+            let opts = PreprocessOptions {
+                speed: 1.5, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7,
+                chunk_seconds: 600.0, method: method.clone(), vad_threshold: 0.5,
+            };
+            let t = std::time::Instant::now();
+            let p = preprocess(&input, &work, &opts, &|_, _| {}).await.unwrap();
+            println!(
+                "{method:?}: {:.1}s → original {:.0}s, sent {:.0}s, {} pieces, {} chunks",
+                t.elapsed().as_secs_f64(), p.original_duration, p.processed_duration, p.map.pieces.len(), p.chunks.len()
+            );
+            let _ = std::fs::remove_dir_all(work);
+        }
     }
 }
 

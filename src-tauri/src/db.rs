@@ -24,6 +24,8 @@ fn migrate(c: &Connection) -> Result<()> {
         ("detected_language", "TEXT"),
         ("version", "INTEGER NOT NULL DEFAULT 1"),
         ("transcribed_at", "TEXT"),
+        ("last_options", "TEXT"),
+        ("notes", "TEXT"),
     ] {
         if !cols.iter().any(|c| c == name) {
             c.execute_batch(&format!("ALTER TABLE transcripts ADD COLUMN {name} {ty}"))?;
@@ -178,6 +180,8 @@ pub struct TranscriptSummary {
     pub version: i64,
     /// When the current version was produced (None for libraries from before versioning).
     pub transcribed_at: Option<String>,
+    /// Parts of the current version that may be incomplete.
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -201,6 +205,8 @@ pub struct TranscriptDetail {
     #[serde(flatten)]
     pub summary: TranscriptSummary,
     pub audio_path: String,
+    /// Options of the most recent job, so a retry can reuse its cached chunks.
+    pub last_options: Option<serde_json::Value>,
     pub segments: Vec<SegmentRow>,
     pub speakers: Vec<Speaker>,
     pub usage: UsageTotals,
@@ -254,6 +260,11 @@ pub fn set_recording_meta(c: &Connection, id: &str, recorded_at: Option<&str>, d
          WHERE id = ?1",
         params![id, recorded_at, detected_language],
     )?;
+    Ok(())
+}
+
+pub fn set_last_options(c: &Connection, id: &str, options: &str) -> Result<()> {
+    c.execute("UPDATE transcripts SET last_options = ?2 WHERE id = ?1", params![id, options])?;
     Ok(())
 }
 
@@ -315,10 +326,23 @@ pub struct CompletedVersion<'a> {
     pub language: Option<&'a str>,
     pub detected_language: Option<&'a str>,
     pub processed_duration: f64,
+    /// Quality problems that couldn't be fixed automatically (one per line).
+    pub notes: Option<String>,
 }
 
 /// Store a finished transcription as the current version, archiving the previous one.
 pub fn commit_version(c: &mut Connection, id: &str, segs: &[crate::providers::Segment], v: &CompletedVersion) -> Result<()> {
+    commit_version_with_speakers(c, id, segs, v, &[])
+}
+
+/// Like `commit_version`, carrying over speaker display names (used when repairing parts).
+pub fn commit_version_with_speakers(
+    c: &mut Connection,
+    id: &str,
+    segs: &[crate::providers::Segment],
+    v: &CompletedVersion,
+    speakers: &[Speaker],
+) -> Result<()> {
     let tx = c.transaction()?;
     let archived = archive_current(&tx, id)?;
     let rows: Vec<SegmentRow> = segs
@@ -333,7 +357,7 @@ pub fn commit_version(c: &mut Connection, id: &str, segs: &[crate::providers::Se
             text: s.text.clone(),
         })
         .collect();
-    insert_segments(&tx, id, &rows, &[])?;
+    insert_segments(&tx, id, &rows, speakers)?;
     let number: i64 = if archived {
         tx.query_row(
             "SELECT MAX((SELECT version FROM transcripts WHERE id = ?1),
@@ -346,10 +370,10 @@ pub fn commit_version(c: &mut Connection, id: &str, segs: &[crate::providers::Se
     };
     tx.execute(
         "UPDATE transcripts SET version = ?2, provider = ?3, model = ?4, language = ?5, detected_language = ?6,
-           processed_duration = ?7, transcribed_at = ?8, error = NULL WHERE id = ?1",
+           processed_duration = ?7, transcribed_at = ?8, error = NULL, notes = ?9 WHERE id = ?1",
         params![
             id, number, v.provider, v.model, v.language, v.detected_language, v.processed_duration,
-            chrono::Local::now().to_rfc3339()
+            chrono::Local::now().to_rfc3339(), v.notes
         ],
     )?;
     tx.commit()?;
@@ -436,7 +460,7 @@ pub fn restore_version(c: &mut Connection, version_id: i64) -> Result<()> {
     insert_segments(&tx, &id, &rows, &speakers)?;
     tx.execute(
         "UPDATE transcripts SET version = ?2, provider = ?3, model = ?4, language = ?5, detected_language = NULL,
-           processed_duration = ?6, transcribed_at = ?7, status = 'done', error = NULL WHERE id = ?1",
+           processed_duration = ?6, transcribed_at = ?7, status = 'done', error = NULL, notes = NULL WHERE id = ?1",
         params![id, number, provider, model, language, processed, transcribed_at],
     )?;
     tx.commit()?;
@@ -482,7 +506,7 @@ fn tags_for(c: &Connection, id: &str) -> Result<Vec<Tag>> {
 const SUMMARY_COLS: &str = "t.id, t.title, t.folder_id, t.source_name, t.duration, t.processed_duration, t.provider,
     t.model, t.status, t.error, t.created_at,
     (SELECT substr(group_concat(text, ' '), 1, 200) FROM (SELECT text FROM segments s WHERE s.transcript_id = t.id ORDER BY idx LIMIT 3)),
-    t.recorded_at, COALESCE(NULLIF(t.language, ''), t.detected_language), t.version, t.transcribed_at";
+    t.recorded_at, COALESCE(NULLIF(t.language, ''), t.detected_language), t.version, t.transcribed_at, t.notes";
 
 fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
     Ok(TranscriptSummary {
@@ -503,6 +527,7 @@ fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
         language: r.get(13)?,
         version: r.get(14)?,
         transcribed_at: r.get(15)?,
+        notes: r.get(16)?,
     })
 }
 
@@ -551,15 +576,18 @@ fn speakers_for(c: &Connection, id: &str) -> Result<Vec<Speaker>> {
 }
 
 pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetail>> {
-    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path FROM transcripts t WHERE t.id = ?1");
-    let row = c.query_row(&sql, [id], |r| Ok((summary_from_row(r)?, r.get::<_, String>(16)?))).optional()?;
-    let Some((mut summary, audio_path)) = row else { return Ok(None) };
+    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path, t.last_options FROM transcripts t WHERE t.id = ?1");
+    let row = c
+        .query_row(&sql, [id], |r| Ok((summary_from_row(r)?, r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?)))
+        .optional()?;
+    let Some((mut summary, audio_path, last_options)) = row else { return Ok(None) };
+    let last_options = last_options.and_then(|s| serde_json::from_str(&s).ok());
     summary.tags = tags_for(c, id)?;
 
     let segments = segments_for(c, id)?;
     let speakers = speakers_for(c, id)?;
     let usage = usage_for_transcript(c, id)?;
-    Ok(Some(TranscriptDetail { summary, audio_path, segments, speakers, usage }))
+    Ok(Some(TranscriptDetail { summary, audio_path, last_options, segments, speakers, usage }))
 }
 
 pub fn update_transcript(c: &Connection, id: &str, title: &str, folder_id: Option<i64>, tag_ids: &[i64]) -> Result<()> {
@@ -888,7 +916,7 @@ mod tests {
         )
         .unwrap();
         let segs = vec![Segment { start: 1.0, end: 2.0, text: "Quarterly revenue looks great".into(), speaker: Some("Speaker 1".into()) }];
-        let v1 = CompletedVersion { provider: "groq", model: "m1", language: None, detected_language: None, processed_duration: 1.0 };
+        let v1 = CompletedVersion { provider: "groq", model: "m1", language: None, detected_language: None, processed_duration: 1.0, notes: None };
         commit_version(&mut c, "t1", &segs, &v1).unwrap();
         assert!(list_versions(&c, "t1").unwrap().is_empty());
 
@@ -929,7 +957,7 @@ mod tests {
 
         // Re-transcribing archives the previous version (with its speaker names).
         let segs2 = vec![Segment { start: 1.0, end: 2.0, text: "Quarterly revenue is great".into(), speaker: Some("Speaker 1".into()) }];
-        let v2 = CompletedVersion { provider: "gemini", model: "m2", language: Some("en"), detected_language: None, processed_duration: 1.0 };
+        let v2 = CompletedVersion { provider: "gemini", model: "m2", language: Some("en"), detected_language: None, processed_duration: 1.0, notes: None };
         commit_version(&mut c, "t1", &segs2, &v2).unwrap();
         let d = get_transcript(&c, "t1").unwrap().unwrap();
         assert_eq!((d.summary.version, d.summary.model.as_str()), (2, "m2"));

@@ -3,6 +3,8 @@ mod db;
 mod export;
 mod jobs;
 mod providers;
+mod quality;
+mod repair;
 mod settings;
 
 use rusqlite::Connection;
@@ -63,7 +65,19 @@ fn spawn_job(
     id: String,
     source: Option<PathBuf>,
     audio_path: PathBuf,
+    opts: jobs::JobOptions,
+) -> CmdResult<()> {
+    spawn_job_with(app, state, id, source, audio_path, opts, None)
+}
+
+fn spawn_job_with(
+    app: &AppHandle,
+    state: &AppState,
+    id: String,
+    source: Option<PathBuf>,
+    audio_path: PathBuf,
     mut opts: jobs::JobOptions,
+    repair: Option<Vec<audio::Interval>>,
 ) -> CmdResult<()> {
     let s = settings::load(&state.settings_path());
     let mut provider = s
@@ -76,9 +90,15 @@ fn spawn_job(
         provider.model = m.trim().to_string();
     }
     opts.model = Some(provider.model.clone());
+    // Repairs reuse the last full run's options; only full runs define them (and its chunk cache).
+    if repair.is_none() {
+        if let Ok(json) = serde_json::to_string(&opts) {
+            let _ = db::set_last_options(&state.db.lock().unwrap(), &id, &json);
+        }
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-    let job = jobs::Job { id, source, audio_path, provider, opts, cancel };
+    let job = jobs::Job { id, source, audio_path, provider, opts, cancel, repair };
     tauri::async_runtime::spawn(jobs::run(app.clone(), job));
     Ok(())
 }
@@ -146,6 +166,53 @@ fn retranscribe(app: AppHandle, state: State<AppState>, id: String, options: job
     spawn_job(&app, &state, id, None, audio_path, options)
 }
 
+/// Stretches of the current version that look wrong (missing text, loops, impossible timings,
+/// missing speaker labels), for re-transcribing only those parts.
+#[tauri::command]
+async fn find_problems(state: State<'_, AppState>, id: String) -> CmdResult<Vec<repair::ProblemRange>> {
+    let (t, want_speakers) = {
+        let db = state.db.lock().unwrap();
+        let t = db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?;
+        let s = settings::load(&state.settings_path());
+        let diarized = s.providers.iter().find(|p| p.id == t.summary.provider).is_some_and(|p| p.diarizes())
+            || t.segments.iter().any(|s| s.speaker.is_some());
+        (t, diarized)
+    };
+    let mut ranges = repair::text_problems(&t.segments, want_speakers);
+    let scratch = state.cache_dir.join(format!("vad-{id}.wav"));
+    std::fs::create_dir_all(&state.cache_dir).map_err(err)?;
+    ranges.extend(
+        repair::missing_speech(&t.segments, t.summary.duration, std::path::Path::new(&t.audio_path), &scratch)
+            .await
+            .map_err(err)?,
+    );
+    Ok(repair::merge_ranges(ranges, t.summary.duration))
+}
+
+/// Re-transcribe only the given stretches (seconds of original audio) and splice them in.
+#[tauri::command]
+fn repair_transcript(
+    app: AppHandle,
+    state: State<AppState>,
+    id: String,
+    ranges: Vec<(f64, f64)>,
+    options: jobs::JobOptions,
+) -> CmdResult<()> {
+    if ranges.is_empty() {
+        return Err("Choose at least one part to fix".into());
+    }
+    let audio_path = {
+        let db = state.db.lock().unwrap();
+        let t = db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?;
+        db::set_status(&db, &id, "processing", None).map_err(err)?;
+        PathBuf::from(t.audio_path)
+    };
+    let mut ranges: Vec<audio::Interval> =
+        ranges.into_iter().filter(|(a, b)| b > a).map(|(start, end)| audio::Interval { start, end }).collect();
+    ranges.sort_by(|a, b| a.start.total_cmp(&b.start));
+    spawn_job_with(&app, &state, id, None, audio_path, options, Some(ranges))
+}
+
 #[tauri::command]
 fn cancel_job(state: State<AppState>, id: String) {
     if let Some(c) = state.cancels.lock().unwrap().get(&id) {
@@ -182,6 +249,7 @@ fn delete_transcript(state: State<AppState>, id: String) -> CmdResult<()> {
         c.store(true, Ordering::Relaxed);
     }
     let audio = db::delete_transcript(&state.db.lock().unwrap(), &id).map_err(err)?;
+    let _ = std::fs::remove_dir_all(state.cache_dir.join("results").join(&id));
     if let Some(p) = audio {
         let _ = std::fs::remove_file(p);
     }
@@ -313,7 +381,8 @@ pub fn run() {
             let conn = db::open(&data_dir.join("library.sqlite"))?;
             db::fail_stale(&conn)?;
             let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(900))
+                // Long chunks (25 min with diarization) can take several minutes to process.
+                .timeout(std::time::Duration::from_secs(1800))
                 .build()?;
             app.manage(AppState {
                 db: Mutex::new(conn),
@@ -330,6 +399,8 @@ pub fn run() {
             default_chunk_minutes,
             start_transcription,
             retranscribe,
+            find_problems,
+            repair_transcript,
             cancel_job,
             list_transcripts,
             get_transcript,

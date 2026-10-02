@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const MIME: &str = "audio/ogg";
+/// No real word lasts longer than this.
+const MAX_WORD_SECS: f64 = 10.0;
 
 pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     if cfg.model.contains("transcribe") {
@@ -27,8 +29,8 @@ fn base(cfg: &ProviderConfig) -> &str {
 // ---------------------------------------------------------------------------
 
 async fn transcribe_model(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
-    let file = upload(client, cfg, req).await?;
-    let result = interact(client, cfg, req, &file).await;
+    let file = upload(client, cfg, req).await.context("uploading audio")?;
+    let result = interact(client, cfg, req, &file).await.context("transcribing");
     // Best-effort cleanup; uploaded files otherwise expire after 48h.
     let _ = client
         .delete(format!("{}/v1beta/{}", base(cfg), file.name))
@@ -120,7 +122,7 @@ async fn interact(
     let resp = client
         .post(format!("{}/v1beta/interactions", base(cfg)))
         .header("x-goog-api-key", &cfg.api_key)
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(1500))
         .json(&body)
         .send()
         .await?;
@@ -143,7 +145,7 @@ async fn interact(
             .await?;
         v = check(r).await?.json().await?;
     }
-    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v) })
+    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v), raw: Some(v) })
 }
 
 #[derive(Debug)]
@@ -165,7 +167,11 @@ fn collect_words(v: &Value, out: &mut Vec<Word>) {
                 ) {
                     out.push(Word {
                         text: text.to_string(),
-                        speaker: m.get("speaker").and_then(Value::as_str).map(speaker_label),
+                        speaker: m
+                            .get("speaker")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(speaker_label),
                         start,
                         end,
                     });
@@ -217,7 +223,13 @@ fn parse_interaction(v: &Value, duration: f64) -> Vec<Segment> {
 
 /// Group words into readable segments: split on speaker change, long pauses,
 /// or at sentence ends once a segment gets long.
-fn group_words(words: Vec<Word>) -> Vec<Segment> {
+fn group_words(mut words: Vec<Word>) -> Vec<Segment> {
+    // Repair impossible word timings (seen on long audio: one word "lasting" most of the chunk).
+    for w in &mut words {
+        if w.end < w.start || w.end - w.start > MAX_WORD_SECS {
+            w.end = w.start + 1.0;
+        }
+    }
     let mut out: Vec<Segment> = Vec::new();
     let mut cur: Option<Segment> = None;
     for w in words {
@@ -292,7 +304,7 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
     let resp = client
         .post(format!("{}/v1beta/models/{}:generateContent", base(cfg), cfg.model))
         .header("x-goog-api-key", &cfg.api_key)
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(1500))
         .json(&body)
         .send()
         .await?;
@@ -301,7 +313,7 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
         .as_array()
         .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
         .unwrap_or_default();
-    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v), language: None })
+    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v), language: None, raw: Some(v) })
 }
 
 fn parse_json_segments(text: &str) -> Result<Vec<Segment>> {
@@ -341,6 +353,17 @@ mod tests {
         assert_eq!(s[0].speaker.as_deref(), Some("Speaker 1"));
         assert_eq!((s[0].start, s[0].end), (0.1, 0.85));
         assert_eq!(s[1].speaker.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn repairs_bogus_word_timings_and_empty_speakers() {
+        let v = json!({"steps": [{"content": [{"type": "text", "text": "a b", "annotations": [
+            {"type": "word_info", "text": "Hello", "speaker": "", "start_offset": "1.0s", "end_offset": "1400.0s"},
+            {"type": "word_info", "text": "there.", "speaker": "", "start_offset": "1.5s", "end_offset": "1.9s"}
+        ]}]}]});
+        let s = parse_interaction(&v, 1500.0);
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].start, s[0].end, s[0].speaker.clone()), (1.0, 1.9, None));
     }
 
     #[test]

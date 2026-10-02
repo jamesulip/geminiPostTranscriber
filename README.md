@@ -24,6 +24,12 @@ Then open **Settings** and paste an API key for Groq, OpenAI, and/or Gemini.
 Data (SQLite library, copied audio, `settings.json`) lives in the app data dir,
 e.g. `~/Library/Application Support/ph.tigergraphics.transcriber/`. API keys are stored there in plain text.
 
+## Long recordings (1–6 h)
+- Preprocessing streams audio: ~10 s per hour of audio, ~20 MB RAM regardless of length.
+- Rate limits are retried using the provider's `Retry-After` (up to 6 attempts).
+- Finished chunks are cached; retrying a failed or interrupted job only re-sends unfinished chunks.
+- Benchmark: `BENCH_AUDIO=/path/long.mp3 cargo test --release bench_preprocess -- --ignored --nocapture`
+
 ## Tests
 ```bash
 cd src-tauri && cargo test

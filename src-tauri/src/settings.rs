@@ -157,12 +157,12 @@ impl Default for Settings {
             silence_threshold_db: -35.0,
             silence_min_duration: 0.7,
             chunk_minutes: 10.0,
-            gemini_chunk_minutes: 25.0,
+            gemini_chunk_minutes: 10.0,
         }
     }
 }
 
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 pub fn load(path: &Path) -> Settings {
     let s: Settings = std::fs::read_to_string(path)
@@ -183,6 +183,13 @@ fn migrate(mut s: Settings) -> Settings {
             s.speed = 1.5;
         }
         s.settings_version = 2;
+    }
+    if s.settings_version < 3 {
+        // v3: 25-minute Gemini chunks often skipped or looped on long meetings; 10 min is far more reliable.
+        if (s.gemini_chunk_minutes - 25.0).abs() < 1e-9 {
+            s.gemini_chunk_minutes = 10.0;
+        }
+        s.settings_version = 3;
     }
     if !s.providers.iter().any(|p| p.id == s.diarize_provider) {
         if let Some(p) = s.providers.iter().find(|p| p.diarizes()) {
@@ -221,7 +228,8 @@ mod tests {
             "remove_silence": true, "silence_threshold_db": -35, "silence_min_duration": 0.7,
             "chunk_minutes": 10, "gemini_chunk_minutes": 25}"#;
         let s = migrate(serde_json::from_str(v1).unwrap());
-        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 2));
+        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 3));
+        assert_eq!(s.gemini_chunk_minutes, 10.0);
         assert_eq!(s.silence_method, SilenceMethod::Speech);
         // A user's own choices are kept.
         let custom = v1.replace("\"gemini\"", "\"openai\"").replace("1.25", "1.1");

@@ -213,7 +213,7 @@ async function save() {
             <div class="grid gap-1.5">
               <Label>Chunk length — Gemini (min)</Label>
               <Input v-model.number="form.gemini_chunk_minutes" type="number" min="1" max="30" />
-              <p class="text-muted-foreground text-xs">Diarized requests are limited to 30 min. Longer chunks keep speaker labels more consistent.</p>
+              <p class="text-muted-foreground text-xs">Shorter chunks are more reliable (long ones can skip or repeat speech); longer ones keep speaker labels more consistent. 10 min recommended.</p>
             </div>
           </CardContent>
         </Card>
