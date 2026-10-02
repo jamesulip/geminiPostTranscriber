@@ -2,11 +2,18 @@ import { defineStore } from "pinia";
 import { reactive } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "vue-sonner";
-import type { Progress } from "@/lib/api";
+import { api, type Progress } from "@/lib/api";
 import { useLibrary } from "./library";
 
 export const useJobs = defineStore("jobs", () => {
   const progress = reactive<Record<string, Progress>>({});
+  /** Jobs the user asked to cancel (shown as "Cancelling…" until they stop). */
+  const cancelling = reactive(new Set<string>());
+
+  async function cancel(id: string) {
+    cancelling.add(id);
+    await api.cancelJob(id);
+  }
   let started = false;
 
   async function start() {
@@ -17,8 +24,10 @@ export const useJobs = defineStore("jobs", () => {
       const p = e.payload;
       if (p.done) {
         delete progress[p.id];
+        const wasCancelled = cancelling.delete(p.id) && p.error === "Cancelled";
         const title = library.transcripts.find((t) => t.id === p.id)?.title ?? "Transcript";
-        if (p.error) toast.error(`${title} failed`, { description: p.error });
+        if (wasCancelled) toast(`${title} cancelled`, { description: "Finished chunks are kept; Retry continues from there." });
+        else if (p.error) toast.error(`${title} failed`, { description: p.error });
         else toast.success(`${title} transcribed`);
       } else {
         progress[p.id] = p;
@@ -26,7 +35,9 @@ export const useJobs = defineStore("jobs", () => {
       // Refresh on stage changes and completion so durations/status stay current.
       void library.refresh();
     });
+    // A reloaded window doesn't receive past events; ask for the current status of running jobs.
+    for (const p of await api.jobProgress()) progress[p.id] = p;
   }
 
-  return { progress, start };
+  return { progress, cancelling, cancel, start };
 });

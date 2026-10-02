@@ -158,6 +158,8 @@ export interface TranscriptDetail extends TranscriptSummary {
   audio_path: string;
   /** Options of the most recent job (reused on retry so finished chunks aren't re-sent). */
   last_options: Partial<JobOptions> | null;
+  /** Chunks finished so far by the current (running or failed) job. */
+  partial: { done: number; total: number; segments: Omit<SegmentRow, "id" | "idx">[] } | null;
   segments: SegmentRow[];
   speakers: Speaker[];
   usage: UsageTotals;
@@ -226,6 +228,7 @@ export const api = {
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
+  jobProgress: () => invoke<Progress[]>("job_progress"),
 
   listTranscripts: (filter: ListFilter) => invoke<TranscriptSummary[]>("list_transcripts", { filter }),
   getTranscript: (id: string) => invoke<TranscriptDetail | null>("get_transcript", { id }),

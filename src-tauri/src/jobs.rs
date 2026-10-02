@@ -65,10 +65,12 @@ pub struct Job {
 }
 
 fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Into<String>) {
-    let _ = app.emit(
-        "job-progress",
-        Progress { id: id.into(), stage: stage.into(), progress, message: message.into(), done: false, error: None },
-    );
+    let p = Progress { id: id.into(), stage: stage.into(), progress, message: message.into(), done: false, error: None };
+    // Remember the latest status so a reloaded window can show it again.
+    if let Some(state) = app.try_state::<AppState>() {
+        state.progress.lock().unwrap().insert(id.to_string(), p.clone());
+    }
+    let _ = app.emit("job-progress", p);
 }
 
 /// What was actually sent to the provider, for usage/cost accounting.
@@ -99,24 +101,46 @@ impl Meter {
 struct ChunkCache {
     dir: PathBuf,
     key: u64,
+    /// Keys used by older versions of the app (which also hashed the language), so chunks saved
+    /// before an update are still found.
+    legacy: Vec<u64>,
 }
 
 impl ChunkCache {
     fn new(cache_dir: &std::path::Path, job: &Job) -> Self {
+        let lang = job.opts.language.as_deref().unwrap_or("");
+        let legacy = [lang, ""].iter().map(|l| Self::hash(job, Some(l))).collect();
+        ChunkCache { dir: cache_dir.join("results").join(&job.id), key: Self::hash(job, None), legacy }
+    }
+
+    /// Only what changes the audio sent or the model matters; the language is just a hint, so
+    /// adding/changing it on retry still reuses finished chunks.
+    fn hash(job: &Job, legacy_language: Option<&str>) -> u64 {
         use std::hash::{Hash, Hasher};
         let o = &job.opts;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (&job.provider.id, &job.provider.model, o.language.as_deref().unwrap_or("")).hash(&mut h);
+        match legacy_language {
+            Some(l) => (&job.provider.id, &job.provider.model, l).hash(&mut h),
+            None => (&job.provider.id, &job.provider.model).hash(&mut h),
+        }
         for v in [o.speed, o.silence_threshold_db, o.silence_min_duration, o.chunk_minutes, o.vad_threshold] {
             v.to_bits().hash(&mut h);
         }
         (o.remove_silence, format!("{:?}", o.silence_method)).hash(&mut h);
         std::fs::metadata(&job.audio_path).map(|m| m.len()).unwrap_or(0).hash(&mut h);
-        ChunkCache { dir: cache_dir.join("results").join(&job.id), key: h.finish() }
+        h.finish()
+    }
+
+    fn file(&self, key: u64, i: usize, c: &audio::Chunk) -> PathBuf {
+        self.dir.join(format!("{key:016x}-{i:04}-{:.3}-{:.3}.json", c.offset, c.duration))
     }
 
     fn path(&self, i: usize, c: &audio::Chunk) -> PathBuf {
-        self.dir.join(format!("{:016x}-{i:04}-{:.3}-{:.3}.json", self.key, c.offset, c.duration))
+        let current = self.file(self.key, i, c);
+        if current.exists() {
+            return current;
+        }
+        self.legacy.iter().map(|k| self.file(*k, i, c)).find(|p| p.exists()).unwrap_or(current)
     }
 
     fn get(&self, i: usize, c: &audio::Chunk) -> Option<Transcription> {
@@ -126,7 +150,7 @@ impl ChunkCache {
     fn put(&self, i: usize, c: &audio::Chunk, t: &Transcription) {
         let _ = std::fs::create_dir_all(&self.dir);
         if let Ok(json) = serde_json::to_string(t) {
-            let _ = std::fs::write(self.path(i, c), json);
+            let _ = std::fs::write(self.file(self.key, i, c), json);
         }
     }
 
@@ -149,6 +173,7 @@ pub async fn run(app: AppHandle, job: Job) {
         cache.clear();
     }
     state.cancels.lock().unwrap().remove(&job.id);
+    state.progress.lock().unwrap().remove(&job.id);
 
     let error = result.err().map(|e| format!("{e:#}"));
     {
@@ -279,14 +304,31 @@ async fn execute(
         meter,
         raw_dir: &raw_dir,
         checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
+        cancel: &job.cancel,
     };
     let notes: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let done = std::sync::atomic::AtomicUsize::new(0);
+    // Finished chunks so far; saved as a partial transcript after each one, so a failed,
+    // cancelled or interrupted job still shows what's done.
+    let finished: Mutex<Vec<Option<Vec<Segment>>>> = Mutex::new(vec![None; n]);
+    {
+        let db = state.db.lock().unwrap();
+        db::set_partial(&db, id, None)?;
+    }
+    let save_partial = |i: usize, segs: &[Segment]| {
+        let json = {
+            let mut f = finished.lock().unwrap();
+            f[i] = Some(segs.to_vec());
+            partial_json(&prepared.chunks, &f, &prepared.map)
+        };
+        let db = state.db.lock().unwrap();
+        let _ = db::set_partial(&db, id, Some(&json));
+    };
     let progress_now = || 0.15 + 0.8 * (done.load(Ordering::Relaxed) as f64 / n as f64);
 
     // One top-level chunk: cached result, or transcribe + check (+ split on problems).
     let run_chunk = |i: usize, chunk: audio::Chunk, speakers: Vec<String>, previous: String| {
-        let (ctx, notes, done) = (&ctx, &notes, &done);
+        let (ctx, notes, done, save_partial) = (&ctx, &notes, &done, &save_partial);
         async move {
             if job.cancel.load(Ordering::Relaxed) {
                 bail!("Cancelled");
@@ -302,6 +344,7 @@ async fn execute(
                     t
                 }
             };
+            save_partial(i, &t.segments);
             let k = done.fetch_add(1, Ordering::Relaxed) + 1;
             emit(app, id, "transcribe", 0.15 + 0.8 * (k as f64 / n as f64), format!("Transcribed chunk {k}/{n}"));
             Ok::<_, anyhow::Error>(t.segments)
@@ -430,6 +473,7 @@ async fn execute_repair(
             meter,
             raw_dir: &raw_dir,
             checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
+            cancel: &job.cancel,
         };
         let on_retry = |msg: String| emit(app, id, "transcribe", base, format!("Part {label}: {msg}"));
         let mut per_chunk = Vec::new();
@@ -523,6 +567,8 @@ pub struct ChunkCtx<'a> {
     /// Raw provider responses are saved here for diagnosing bad transcripts.
     pub raw_dir: &'a std::path::Path,
     pub checks: quality::CheckOptions,
+    /// The job's Cancel flag.
+    pub cancel: &'a AtomicBool,
 }
 
 /// Transcribe a chunk and check the result. On problems (skipped speech, loops, impossible timings,
@@ -545,6 +591,7 @@ pub fn transcribe_checked<'a>(
             known_speakers: &speakers,
             previous_text: &previous,
             on_retry,
+            cancel: ctx.cancel,
         };
         let mut t = providers::transcribe(ctx.client, ctx.cfg, &req).await?;
         ctx.meter.lock().unwrap().add(chunk.duration, t.usage, t.language.clone());
@@ -593,6 +640,17 @@ fn span(c: &audio::Chunk) -> String {
     format!("{:.0}–{:.0} min of sent audio", c.offset / 60.0, (c.offset + c.duration) / 60.0)
 }
 
+/// The finished chunks so far, in original time, as JSON: `{done, total, segments}`.
+pub fn partial_json(chunks: &[audio::Chunk], finished: &[Option<Vec<Segment>>], map: &audio::TimeMap) -> String {
+    let (done_chunks, done_segs): (Vec<audio::Chunk>, Vec<Vec<Segment>>) = chunks
+        .iter()
+        .zip(finished)
+        .filter_map(|(c, f)| f.as_ref().map(|s| (c.clone(), s.clone())))
+        .unzip();
+    let segments = quality::remove_loops(merge(&done_chunks, done_segs, map)).0;
+    serde_json::json!({ "done": done_chunks.len(), "total": chunks.len(), "segments": segments }).to_string()
+}
+
 /// Chunk-relative → processed → original time, sorted.
 pub fn merge(chunks: &[audio::Chunk], per_chunk: Vec<Vec<Segment>>, map: &audio::TimeMap) -> Vec<Segment> {
     let mut merged: Vec<Segment> = chunks
@@ -624,6 +682,19 @@ pub fn chunk_minutes_default(kind: &ProviderKind, s: &crate::settings::Settings)
 mod tests {
     use super::*;
     use crate::settings::ProviderKind;
+
+    #[test]
+    fn partial_json_maps_only_finished_chunks() {
+        let map = audio::TimeMap::new(&[audio::Interval { start: 0.0, end: 100.0 }, audio::Interval { start: 200.0, end: 300.0 }], 1.0);
+        let chunk = |o: f64| audio::Chunk { path: PathBuf::new(), offset: o, duration: 100.0 };
+        let seg = |t: &str| Segment { start: 10.0, end: 12.0, text: t.into(), speaker: None };
+        let json: serde_json::Value =
+            serde_json::from_str(&partial_json(&[chunk(0.0), chunk(100.0)], &[None, Some(vec![seg("second chunk")])], &map)).unwrap();
+        assert_eq!((json["done"].as_u64(), json["total"].as_u64()), (Some(1), Some(2)));
+        // Chunk 2 starts at processed 100 s = original 200 s.
+        assert_eq!(json["segments"][0]["start"].as_f64(), Some(210.0));
+        assert_eq!(json["segments"][0]["text"], "second chunk");
+    }
 
     #[test]
     fn splice_replaces_only_the_repaired_ranges() {
@@ -660,10 +731,11 @@ mod tests {
         let cut_points = prepared.map.boundaries();
         let raw_dir = work.join("raw");
         std::fs::create_dir_all(&raw_dir).unwrap();
+        let never = AtomicBool::new(false);
         let ctx = ChunkCtx {
             client: &client, cfg: &cfg, language: None, condensed: &prepared.condensed, cut_points: &cut_points,
             work: &work, meter: &meter, raw_dir: &raw_dir,
-            checks: quality::CheckOptions { condensed: true, want_speakers: false },
+            checks: quality::CheckOptions { condensed: true, want_speakers: false }, cancel: &never,
         };
         let on_retry = |m: String| println!("{m}");
         let mut per_chunk = vec![];
@@ -679,3 +751,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(work);
     }
 }
+

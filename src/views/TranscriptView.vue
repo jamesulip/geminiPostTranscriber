@@ -107,6 +107,13 @@ watch(id, async () => {
   jumpFromQuery();
 });
 watch(() => route.query, jumpFromQuery);
+// Show newly finished chunks while the job runs.
+watch(
+  () => job.value?.message,
+  (m) => {
+    if (m?.startsWith("Transcribed chunk")) void load();
+  },
+);
 // Reload when this transcript's job finishes.
 watch(job, (now, before) => {
   if (before && !now) void load();
@@ -116,8 +123,20 @@ const src = computed(() => (t.value ? convertFileSrc(t.value.audio_path) : ""));
 const duration = computed(() => t.value?.duration || audioDuration.value);
 
 /** Segments/speakers of the version on screen. */
-const segments = computed<SegmentRow[]>(() => viewing.value?.segments ?? t.value?.segments ?? []);
-const readOnly = computed(() => !!viewing.value);
+/** While a job runs or after it failed (with nothing saved yet), show the chunks finished so far. */
+const showingPartial = computed(
+  () => !viewing.value && !!t.value && !t.value.segments.length && !!t.value.partial?.segments.length,
+);
+const partialRows = computed<SegmentRow[]>(() =>
+  (t.value?.partial?.segments ?? []).map((s, i) => ({ ...s, id: -(i + 1), idx: i })),
+);
+const partialUntil = computed(() => partialRows.value.at(-1)?.end ?? 0);
+const segments = computed<SegmentRow[]>(
+  () => viewing.value?.segments ?? (showingPartial.value ? partialRows.value : t.value?.segments ?? []),
+);
+const readOnly = computed(() => !!viewing.value || showingPartial.value);
+/** Length used for the timeline and pause markers: not-yet-transcribed audio isn't a "break". */
+const shownDuration = computed(() => (showingPartial.value ? partialUntil.value : duration.value));
 
 const speakerOrder = computed(() => {
   const order: string[] = [];
@@ -143,7 +162,7 @@ type Row = { kind: "seg"; seg: SegmentRow } | { kind: "break"; gap: Gap };
 const rows = computed<Row[]>(() => {
   const segs = shown.value;
   if (filtering.value) return segs.map((seg) => ({ kind: "seg", seg }));
-  const gaps = findGaps(segs, duration.value, BREAK_SECONDS);
+  const gaps = findGaps(segs, shownDuration.value, BREAK_SECONDS);
   const out: Row[] = [];
   let g = 0;
   for (const seg of segs) {
@@ -383,7 +402,7 @@ const saved = computed(() =>
       </DropdownMenu>
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
-          <Button variant="outline" :disabled="!segments.length"><Download /> Export</Button>
+          <Button variant="outline" :disabled="!segments.length || showingPartial"><Download /> Export</Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem @click="doExport('txt')">Plain text (.txt)</DropdownMenuItem>
@@ -400,7 +419,7 @@ const saved = computed(() =>
             <Wrench /> Fix problems…
           </DropdownMenuItem>
           <DropdownMenuItem :disabled="t.status === 'processing'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
-          <DropdownMenuItem v-if="t.status === 'processing'" @click="api.cancelJob(t.id)">Cancel job</DropdownMenuItem>
+          <DropdownMenuItem v-if="t.status === 'processing'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" @click="remove"><Trash2 /> Delete</DropdownMenuItem>
         </DropdownMenuContent>
@@ -501,7 +520,7 @@ const saved = computed(() =>
         v-if="segments.length"
         :segments="segments"
         :collapse="collapseBreaks"
-        :duration="duration"
+        :duration="shownDuration"
         :current-time="currentTime"
         :speaker-order="speakerOrder"
         :names="names"
@@ -511,11 +530,13 @@ const saved = computed(() =>
     </section>
 
     <!-- Status -->
-    <div v-if="t.status === 'processing'" class="flex flex-col items-center justify-center gap-3 p-10">
+    <div v-if="t.status === 'processing'" class="flex flex-col items-center justify-center gap-3" :class="showingPartial ? 'border-b p-4' : 'p-10'">
       <Loader2 class="text-primary size-8 animate-spin" />
-      <p class="text-sm">{{ job?.message ?? "Processing…" }}</p>
+      <p class="text-sm">{{ jobs.cancelling.has(t.id) ? "Cancelling…" : job?.message ?? "Processing…" }}</p>
       <Progress :model-value="(job?.progress ?? 0.02) * 100" class="h-1.5 w-80" />
-      <Button variant="ghost" size="sm" @click="api.cancelJob(t.id)">Cancel</Button>
+      <Button variant="ghost" size="sm" :disabled="jobs.cancelling.has(t.id)" @click="jobs.cancel(t.id)">
+        {{ jobs.cancelling.has(t.id) ? "Cancelling…" : "Cancel" }}
+      </Button>
     </div>
     <div v-else-if="t.status === 'error'" class="m-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950/40">
       <AlertCircle class="text-destructive mt-0.5 size-5 shrink-0" />
@@ -524,6 +545,21 @@ const saved = computed(() =>
         <p class="text-muted-foreground mt-1 text-sm break-words whitespace-pre-wrap">{{ t.error }}</p>
       </div>
       <Button variant="outline" @click="openRetry"><RefreshCw /> Retry</Button>
+    </div>
+    <div
+      v-if="showingPartial && t.partial"
+      class="mx-6 mb-2 flex items-center gap-2 rounded-lg border border-dashed px-4 py-2 text-sm"
+      :class="t.status === 'error' ? '-mt-3' : 'mt-3'"
+    >
+      <Loader2 v-if="t.status === 'processing'" class="text-muted-foreground size-4 animate-spin" />
+      <span>
+        Partial transcript: <b>{{ t.partial.done }} of {{ t.partial.total }}</b> chunks done, up to
+        <b class="tabular-nums">{{ formatTime(partialUntil) }}</b> of {{ formatTime(duration) }}.
+        <template v-if="t.status === 'error'">
+          <b>Retry</b> finishes the rest; finished chunks aren't sent (or billed) again.
+        </template>
+        <template v-else>More appears as chunks finish.</template>
+      </span>
     </div>
 
     <!-- Transcript -->

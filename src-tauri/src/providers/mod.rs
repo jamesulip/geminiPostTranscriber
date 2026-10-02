@@ -109,6 +109,15 @@ pub struct Request<'a> {
     pub previous_text: &'a str,
     /// Called with a status message when waiting before a retry (e.g. rate limits).
     pub on_retry: &'a (dyn Fn(String) + Send + Sync),
+    /// Set by the Cancel button; checked during requests and retry waits.
+    pub cancel: &'a std::sync::atomic::AtomicBool,
+}
+
+/// Resolves once `flag` is set (polled; cheap).
+async fn cancelled(flag: &std::sync::atomic::AtomicBool) {
+    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Retries for server/network errors.
@@ -130,9 +139,19 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let mut attempt = 0;
     let mut waited = 0u64;
     loop {
-        let res = match cfg.kind {
-            ProviderKind::Openai => openai_compat::transcribe(client, cfg, req).await,
-            ProviderKind::Gemini => gemini::transcribe(client, cfg, req).await,
+        if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("Cancelled");
+        }
+        let call = async {
+            match cfg.kind {
+                ProviderKind::Openai => openai_compat::transcribe(client, cfg, req).await,
+                ProviderKind::Gemini => gemini::transcribe(client, cfg, req).await,
+            }
+        };
+        // Cancel stops an in-flight request too (it can take minutes for long chunks).
+        let res = tokio::select! {
+            r = call => r,
+            _ = cancelled(req.cancel) => bail!("Cancelled"),
         };
         let http = res.as_ref().err().and_then(|e| e.downcast_ref::<HttpError>());
         let rate_limited = http.is_some_and(|h| h.status == 429 && !h.daily);
@@ -160,7 +179,10 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
                 };
                 let tries = if rate_limited { format!("waited {}m so far", waited / 60) } else { format!("attempt {}/{MAX_ATTEMPTS}", attempt + 1) };
                 (req.on_retry)(format!("{why} — retrying in {wait}s ({tries})"));
-                tokio::time::sleep(Duration::from_secs(wait)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                    _ = cancelled(req.cancel) => bail!("Cancelled"),
+                }
             }
             other => {
                 return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), ..t })
@@ -299,6 +321,43 @@ mod tests {
         assert_eq!(parse_time(&json!("01:15.5")), Some(75.5));
         assert_eq!(parse_time(&json!("1:02:03")), Some(3723.0));
         assert_eq!(parse_time(&json!("abc")), None);
+    }
+
+    /// Cancel must stop a request that never answers (and not wait for timeouts or retries).
+    #[tokio::test]
+    async fn cancel_interrupts_hanging_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // A server that accepts connections and never responds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let audio = std::env::temp_dir().join(format!("cancel-test-{}.ogg", uuid::Uuid::new_v4()));
+        std::fs::write(&audio, b"fake").unwrap();
+        let cfg = ProviderConfig {
+            id: "t".into(), name: "Test".into(), kind: ProviderKind::Openai, base_url: format!("http://{addr}"),
+            api_key: "k".into(), model: "m".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            c2.store(true, Ordering::Relaxed);
+        });
+        let req = Request {
+            path: &audio, duration: 10.0, language: None, known_speakers: &[], previous_text: "",
+            on_retry: &|_| {}, cancel: &cancel,
+        };
+        let start = std::time::Instant::now();
+        let err = transcribe(&reqwest::Client::new(), &cfg, &req).await.unwrap_err();
+        assert_eq!(err.to_string(), "Cancelled");
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+        let _ = std::fs::remove_file(audio);
     }
 
     #[test]

@@ -26,6 +26,7 @@ fn migrate(c: &Connection) -> Result<()> {
         ("transcribed_at", "TEXT"),
         ("last_options", "TEXT"),
         ("notes", "TEXT"),
+        ("partial", "TEXT"),
     ] {
         if !cols.iter().any(|c| c == name) {
             c.execute_batch(&format!("ALTER TABLE transcripts ADD COLUMN {name} {ty}"))?;
@@ -207,6 +208,8 @@ pub struct TranscriptDetail {
     pub audio_path: String,
     /// Options of the most recent job, so a retry can reuse its cached chunks.
     pub last_options: Option<serde_json::Value>,
+    /// Text from the chunks finished so far by the current (running or failed) job.
+    pub partial: Option<serde_json::Value>,
     pub segments: Vec<SegmentRow>,
     pub speakers: Vec<Speaker>,
     pub usage: UsageTotals,
@@ -260,6 +263,12 @@ pub fn set_recording_meta(c: &Connection, id: &str, recorded_at: Option<&str>, d
          WHERE id = ?1",
         params![id, recorded_at, detected_language],
     )?;
+    Ok(())
+}
+
+/// Store (or clear) the partial transcript of a running/failed job.
+pub fn set_partial(c: &Connection, id: &str, partial: Option<&str>) -> Result<()> {
+    c.execute("UPDATE transcripts SET partial = ?2 WHERE id = ?1", params![id, partial])?;
     Ok(())
 }
 
@@ -370,7 +379,7 @@ pub fn commit_version_with_speakers(
     };
     tx.execute(
         "UPDATE transcripts SET version = ?2, provider = ?3, model = ?4, language = ?5, detected_language = ?6,
-           processed_duration = ?7, transcribed_at = ?8, error = NULL, notes = ?9 WHERE id = ?1",
+           processed_duration = ?7, transcribed_at = ?8, error = NULL, notes = ?9, partial = NULL WHERE id = ?1",
         params![
             id, number, v.provider, v.model, v.language, v.detected_language, v.processed_duration,
             chrono::Local::now().to_rfc3339(), v.notes
@@ -576,18 +585,26 @@ fn speakers_for(c: &Connection, id: &str) -> Result<Vec<Speaker>> {
 }
 
 pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetail>> {
-    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path, t.last_options FROM transcripts t WHERE t.id = ?1");
+    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path, t.last_options, t.partial FROM transcripts t WHERE t.id = ?1");
     let row = c
-        .query_row(&sql, [id], |r| Ok((summary_from_row(r)?, r.get::<_, String>(17)?, r.get::<_, Option<String>>(18)?)))
+        .query_row(&sql, [id], |r| {
+            Ok((
+                summary_from_row(r)?,
+                r.get::<_, String>(17)?,
+                r.get::<_, Option<String>>(18)?,
+                r.get::<_, Option<String>>(19)?,
+            ))
+        })
         .optional()?;
-    let Some((mut summary, audio_path, last_options)) = row else { return Ok(None) };
+    let Some((mut summary, audio_path, last_options, partial)) = row else { return Ok(None) };
     let last_options = last_options.and_then(|s| serde_json::from_str(&s).ok());
+    let partial = partial.and_then(|s| serde_json::from_str(&s).ok());
     summary.tags = tags_for(c, id)?;
 
     let segments = segments_for(c, id)?;
     let speakers = speakers_for(c, id)?;
     let usage = usage_for_transcript(c, id)?;
-    Ok(Some(TranscriptDetail { summary, audio_path, last_options, segments, speakers, usage }))
+    Ok(Some(TranscriptDetail { summary, audio_path, last_options, partial, segments, speakers, usage }))
 }
 
 pub fn update_transcript(c: &Connection, id: &str, title: &str, folder_id: Option<i64>, tag_ids: &[i64]) -> Result<()> {

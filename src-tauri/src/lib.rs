@@ -21,6 +21,8 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub http: reqwest::Client,
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Latest progress of running jobs (for windows that reload mid-job).
+    pub progress: Mutex<HashMap<String, jobs::Progress>>,
 }
 
 impl AppState {
@@ -213,6 +215,12 @@ fn repair_transcript(
     spawn_job_with(&app, &state, id, None, audio_path, options, Some(ranges))
 }
 
+/// Latest progress of every running job.
+#[tauri::command]
+fn job_progress(state: State<AppState>) -> Vec<jobs::Progress> {
+    state.progress.lock().unwrap().values().cloned().collect()
+}
+
 #[tauri::command]
 fn cancel_job(state: State<AppState>, id: String) {
     if let Some(c) = state.cancels.lock().unwrap().get(&id) {
@@ -390,6 +398,7 @@ pub fn run() {
                 cache_dir,
                 http,
                 cancels: Mutex::new(HashMap::new()),
+                progress: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -402,6 +411,7 @@ pub fn run() {
             find_problems,
             repair_transcript,
             cancel_job,
+            job_progress,
             list_transcripts,
             get_transcript,
             update_transcript,
