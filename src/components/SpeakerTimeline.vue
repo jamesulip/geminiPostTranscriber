@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { Pause } from "@lucide/vue";
 import type { SegmentRow } from "@/lib/api";
 import { formatTime, speakerColor } from "@/lib/format";
+import { findGaps, formatGap, TimelineScale } from "@/lib/breaks";
 
 const props = defineProps<{
   segments: SegmentRow[];
@@ -10,32 +12,28 @@ const props = defineProps<{
   speakerOrder: string[];
   names: Record<string, string>;
   matches: Set<number>;
+  /** Shrink long stretches without speech to a small marker. */
+  collapse: boolean;
 }>();
 const emit = defineEmits<{ seek: [time: number] }>();
 
 const lanes = computed(() => {
-  const labels = props.speakerOrder.length ? props.speakerOrder : [];
   const hasUnknown = props.segments.some((s) => !s.speaker);
-  return [...labels.map((l) => l as string | null), ...(hasUnknown ? [null] : [])];
+  return [...props.speakerOrder.map((l) => l as string | null), ...(hasUnknown ? [null] : [])];
 });
 const total = computed(() => Math.max(props.duration, props.segments.at(-1)?.end ?? 0, 1));
-const pct = (t: number) => `${(t / total.value) * 100}%`;
+const gaps = computed(() => findGaps(props.segments, total.value));
+const scale = computed(() => new TimelineScale(total.value, props.collapse ? gaps.value : []));
+const pct = (t: number) => `${scale.value.pos(t) * 100}%`;
+const span = (a: number, b: number) => `${(scale.value.pos(b) - scale.value.pos(a)) * 100}%`;
 
 const track = ref<HTMLElement | null>(null);
 const hover = ref<number | null>(null);
 
 function timeAt(e: MouseEvent) {
   const r = track.value!.getBoundingClientRect();
-  return Math.min(Math.max(0, (e.clientX - r.left) / r.width), 1) * total.value;
+  return scale.value.time((e.clientX - r.left) / r.width);
 }
-
-const ticks = computed(() => {
-  const steps = [10, 30, 60, 120, 300, 600, 900, 1800, 3600];
-  const step = steps.find((s) => total.value / s <= 10) ?? 3600;
-  const out: number[] = [];
-  for (let t = 0; t <= total.value; t += step) out.push(t);
-  return out;
-});
 </script>
 
 <template>
@@ -43,7 +41,7 @@ const ticks = computed(() => {
     <div class="flex">
       <div class="w-24 shrink-0" />
       <div class="text-muted-foreground relative h-4 flex-1 text-[10px] tabular-nums">
-        <span v-for="t in ticks" :key="t" class="absolute -translate-x-1/2" :style="{ left: pct(t) }">{{ formatTime(t) }}</span>
+        <span v-for="t in scale.ticks()" :key="t" class="absolute -translate-x-1/2" :style="{ left: pct(t) }">{{ formatTime(t) }}</span>
       </div>
     </div>
     <div class="flex">
@@ -66,9 +64,22 @@ const ticks = computed(() => {
             :key="s.id"
             class="absolute top-1 bottom-1 rounded-sm"
             :class="matches.size && !matches.has(s.id) ? 'opacity-25' : 'opacity-90'"
-            :style="{ left: pct(s.start), width: `max(2px, ${pct(s.end - s.start)})`, backgroundColor: speakerColor(l, speakerOrder) }"
+            :style="{ left: pct(s.start), width: `max(2px, ${span(s.start, s.end)})`, backgroundColor: speakerColor(l, speakerOrder) }"
             :title="`${formatTime(s.start)} ${s.text}`"
           />
+        </div>
+        <!-- Breaks -->
+        <div
+          v-for="g in gaps"
+          :key="g.start"
+          class="pointer-events-none absolute top-0 bottom-0 flex items-center justify-center overflow-hidden"
+          :class="collapse ? 'break-stripes border-x border-dashed border-slate-300 dark:border-slate-600' : ''"
+          :style="{ left: pct(g.start), width: span(g.start, g.end) }"
+        >
+          <span
+            class="text-muted-foreground bg-background/80 flex items-center gap-0.5 rounded px-1 text-[10px] whitespace-nowrap tabular-nums"
+            :title="`No speech for ${formatGap(g.end - g.start)}`"
+          ><Pause class="size-2.5" />{{ formatGap(g.end - g.start) }}</span>
         </div>
         <div class="bg-foreground pointer-events-none absolute top-0 bottom-0 w-px" :style="{ left: pct(currentTime) }" />
         <div
@@ -86,3 +97,13 @@ const ticks = computed(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.break-stripes {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    color-mix(in oklab, currentColor 10%, transparent) 0 4px,
+    transparent 4px 8px
+  );
+}
+</style>

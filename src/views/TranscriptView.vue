@@ -5,7 +5,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
-  AlertCircle, ArrowLeft, Download, Loader2, LocateFixed, MoreHorizontal, Pause, Play, RefreshCw, Search, Trash2,
+  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, PauseCircle, Play,
+  RefreshCw, RotateCcw, Search, Shrink, Trash2,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,10 +20,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import FolderSelect from "@/components/FolderSelect.vue";
 import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
+import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
 import PromptDialog from "@/components/PromptDialog.vue";
-import { api, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail } from "@/lib/api";
-import { formatDuration, formatTime, formatUsd, speakerColor } from "@/lib/format";
+import {
+  api, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail, type VersionDetail, type VersionInfo,
+} from "@/lib/api";
+import { formatDate, formatDuration, formatLanguage, formatTime, formatUsd, speakerColor } from "@/lib/format";
+import { BREAK_SECONDS, findGaps, formatGap, type Gap } from "@/lib/breaks";
 import { highlightHtml } from "@/lib/highlight";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
 import { useJobs } from "@/stores/jobs";
@@ -47,6 +52,11 @@ const audioDuration = ref(0);
 const playing = ref(false);
 const rate = ref("1");
 const follow = ref(true);
+const collapseBreaks = ref(true);
+
+/** Archived versions, and the one being viewed (null = current). */
+const versions = ref<VersionInfo[]>([]);
+const viewing = ref<VersionDetail | null>(null);
 
 const find = ref("");
 const onlyMatches = ref(false);
@@ -63,6 +73,8 @@ async function load() {
     return;
   }
   t.value = d;
+  versions.value = await api.listVersions(d.id);
+  if (viewing.value && !versions.value.some((v) => v.id === viewing.value!.id)) viewing.value = null;
   title.value = d.title;
   folderId.value = d.folder_id;
   tagIds.value = d.tags.map((x) => x.id);
@@ -85,29 +97,47 @@ watch(job, (now, before) => {
 const src = computed(() => (t.value ? convertFileSrc(t.value.audio_path) : ""));
 const duration = computed(() => t.value?.duration || audioDuration.value);
 
+/** Segments/speakers of the version on screen. */
+const segments = computed<SegmentRow[]>(() => viewing.value?.segments ?? t.value?.segments ?? []);
+const readOnly = computed(() => !!viewing.value);
+
 const speakerOrder = computed(() => {
   const order: string[] = [];
-  for (const s of t.value?.segments ?? []) if (s.speaker && !order.includes(s.speaker)) order.push(s.speaker);
+  for (const s of segments.value) if (s.speaker && !order.includes(s.speaker)) order.push(s.speaker);
   return order;
 });
 const names = computed<Record<string, string>>(() =>
-  Object.fromEntries((t.value?.speakers ?? []).map((s) => [s.label, s.display_name])),
+  Object.fromEntries((viewing.value?.speakers ?? t.value?.speakers ?? []).map((s) => [s.label, s.display_name])),
 );
 const speakerName = (label: string | null) => (label ? names.value[label] ?? label : "Unlabeled");
 
 const matches = computed(() => {
   const q = find.value.trim().toLowerCase();
-  if (!q || !t.value) return new Set<number>();
+  if (!q) return new Set<number>();
   const words = q.split(/\s+/);
-  return new Set(t.value.segments.filter((s) => words.every((w) => s.text.toLowerCase().includes(w))).map((s) => s.id));
+  return new Set(segments.value.filter((s) => words.every((w) => s.text.toLowerCase().includes(w))).map((s) => s.id));
 });
-const shown = computed(() => {
-  const segs = t.value?.segments ?? [];
-  return onlyMatches.value && find.value.trim() ? segs.filter((s) => matches.value.has(s.id)) : segs;
+const filtering = computed(() => onlyMatches.value && !!find.value.trim());
+const shown = computed(() => (filtering.value ? segments.value.filter((s) => matches.value.has(s.id)) : segments.value));
+
+/** Segment list with "pause" dividers wherever speech stops for a while (not while filtering). */
+type Row = { kind: "seg"; seg: SegmentRow } | { kind: "break"; gap: Gap };
+const rows = computed<Row[]>(() => {
+  const segs = shown.value;
+  if (filtering.value) return segs.map((seg) => ({ kind: "seg", seg }));
+  const gaps = findGaps(segs, duration.value, BREAK_SECONDS);
+  const out: Row[] = [];
+  let g = 0;
+  for (const seg of segs) {
+    while (g < gaps.length && gaps[g].end <= seg.start + 1e-6) out.push({ kind: "break", gap: gaps[g++] });
+    out.push({ kind: "seg", seg });
+  }
+  while (g < gaps.length) out.push({ kind: "break", gap: gaps[g++] });
+  return out;
 });
 
 const activeId = computed(() => {
-  const segs = t.value?.segments ?? [];
+  const segs = segments.value;
   let found: SegmentRow | undefined;
   for (const s of segs) {
     if (s.start <= currentTime.value + 0.05) found = s;
@@ -193,15 +223,37 @@ async function reassign(seg: SegmentRow, label: string) {
   seg.speaker = label;
 }
 
+async function viewVersion(v: VersionInfo | null) {
+  editing.value = null;
+  viewing.value = v ? await api.getVersion(v.id) : null;
+}
+
+async function restoreViewed() {
+  if (!viewing.value) return;
+  const n = viewing.value.number;
+  await api.restoreVersion(viewing.value.id);
+  viewing.value = null;
+  await Promise.all([load(), library.refresh()]);
+  toast.success(`Restored version ${n}`, { description: "The previous current version was kept in the history." });
+}
+
+async function deleteViewed() {
+  if (!viewing.value) return;
+  await api.deleteVersion(viewing.value.id);
+  viewing.value = null;
+  await load();
+}
+
 async function doExport(format: ExportFormat) {
   if (!t.value) return;
+  const suffix = viewing.value ? ` (v${viewing.value.number})` : "";
   const path = await save({
-    defaultPath: `${t.value.title}.${format}`,
+    defaultPath: `${t.value.title}${suffix}.${format}`,
     filters: [{ name: format.toUpperCase(), extensions: [format] }],
   });
   if (!path) return;
   try {
-    await api.exportTranscript(t.value.id, format, path);
+    await api.exportTranscript(t.value.id, format, path, viewing.value?.id ?? null);
     toast.success(`Exported ${format.toUpperCase()}`);
   } catch (e) {
     toast.error("Export failed", { description: String(e) });
@@ -254,7 +306,38 @@ const saved = computed(() =>
       <div class="w-56"><TagPicker v-model="tagIds" /></div>
       <DropdownMenu>
         <DropdownMenuTrigger as-child>
-          <Button variant="outline" :disabled="t.status !== 'done'"><Download /> Export</Button>
+          <Button variant="outline" :class="viewing && 'border-amber-400 text-amber-700 dark:text-amber-400'" title="Transcription history">
+            <History /> v{{ viewing?.number ?? t.version }}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" class="w-[26rem]">
+          <DropdownMenuLabel>Transcription history</DropdownMenuLabel>
+          <DropdownMenuItem class="items-start" @click="viewVersion(null)">
+            <Check class="mt-0.5" :class="viewing && 'invisible'" />
+            <div class="grid min-w-0">
+              <span class="font-medium">v{{ t.version }} · current</span>
+              <span class="text-muted-foreground truncate text-xs">
+                {{ t.model }} · {{ formatLanguage(t.language) }} · {{ formatDate(t.transcribed_at ?? t.created_at) }}
+              </span>
+            </div>
+          </DropdownMenuItem>
+          <DropdownMenuItem v-for="v in versions" :key="v.id" class="items-start" @click="viewVersion(v)">
+            <Check class="mt-0.5" :class="viewing?.id !== v.id && 'invisible'" />
+            <div class="grid min-w-0">
+              <span>v{{ v.number }}</span>
+              <span class="text-muted-foreground truncate text-xs">
+                {{ v.model }} · {{ formatLanguage(v.language) }} · {{ formatDate(v.transcribed_at) }} · {{ v.segment_count }} segments
+              </span>
+            </div>
+          </DropdownMenuItem>
+          <p v-if="!versions.length" class="text-muted-foreground px-2 py-1.5 text-xs">
+            Re-transcribing keeps earlier versions here.
+          </p>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <DropdownMenu>
+        <DropdownMenuTrigger as-child>
+          <Button variant="outline" :disabled="!segments.length"><Download /> Export</Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <DropdownMenuItem @click="doExport('txt')">Plain text (.txt)</DropdownMenuItem>
@@ -274,6 +357,35 @@ const saved = computed(() =>
         </DropdownMenuContent>
       </DropdownMenu>
     </header>
+
+    <div class="flex items-center gap-3 border-b px-6 py-2">
+      <TranscriptMeta :t="t" />
+      <span class="text-muted-foreground ml-auto truncate text-xs" :title="t.source_name">{{ t.source_name }}</span>
+    </div>
+
+    <div
+      v-if="viewing"
+      class="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm dark:border-amber-900 dark:bg-amber-950/40"
+    >
+      <History class="size-4 shrink-0 text-amber-600" />
+      <span class="min-w-0 truncate">
+        Viewing <b>v{{ viewing.number }}</b> · {{ viewing.model }} · {{ formatLanguage(viewing.language) }} ·
+        {{ formatDate(viewing.transcribed_at) }} — read-only
+      </span>
+      <div class="ml-auto flex shrink-0 gap-1.5">
+        <Button size="sm" @click="restoreViewed"><RotateCcw /> Restore this version</Button>
+        <Button size="sm" variant="ghost" @click="deleteViewed"><Trash2 /> Delete</Button>
+        <Button size="sm" variant="outline" @click="viewVersion(null)">Back to current</Button>
+      </div>
+    </div>
+    <div
+      v-else-if="t.status === 'done' && t.error"
+      class="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm dark:border-amber-900 dark:bg-amber-950/40"
+    >
+      <AlertTriangle class="size-4 shrink-0 text-amber-600" />
+      <span class="min-w-0 truncate" :title="t.error">Last re-transcription failed — still showing v{{ t.version }}. {{ t.error }}</span>
+      <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="openRetry"><RefreshCw /> Retry</Button>
+    </div>
 
     <!-- Player + timeline -->
     <section class="border-b px-6 py-4">
@@ -304,8 +416,15 @@ const saved = computed(() =>
           title="Auto-scroll to the current segment"
           @click="follow = !follow"
         ><LocateFixed /> Follow</Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          :class="collapseBreaks ? 'text-primary' : 'text-muted-foreground'"
+          title="Shrink long stretches without speech on the timeline"
+          @click="collapseBreaks = !collapseBreaks"
+        ><Shrink /> Collapse breaks</Button>
         <span class="text-muted-foreground ml-auto text-xs">
-          {{ t.provider }} · {{ t.model }}
+          {{ t.provider }}
           <template v-if="saved !== null"> · {{ formatDuration(t.duration) }} → {{ formatDuration(t.processed_duration) }} sent ({{ saved }}% less)</template>
           <template v-if="t.usage.jobs">
             ·
@@ -317,8 +436,9 @@ const saved = computed(() =>
         </span>
       </div>
       <SpeakerTimeline
-        v-if="t.segments.length"
-        :segments="t.segments"
+        v-if="segments.length"
+        :segments="segments"
+        :collapse="collapseBreaks"
         :duration="duration"
         :current-time="currentTime"
         :speaker-order="speakerOrder"
@@ -345,7 +465,7 @@ const saved = computed(() =>
     </div>
 
     <!-- Transcript -->
-    <template v-if="t.segments.length">
+    <template v-if="segments.length">
       <div class="flex items-center gap-2 px-6 pt-4">
         <div class="relative w-72">
           <Search class="text-muted-foreground absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
@@ -361,8 +481,9 @@ const saved = computed(() =>
           <button
             v-for="l in speakerOrder"
             :key="l"
-            class="hover:bg-accent flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs"
-            title="Rename speaker"
+            class="hover:bg-accent flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs disabled:pointer-events-none"
+            :title="readOnly ? '' : 'Rename speaker'"
+            :disabled="readOnly"
             @click="renaming = l"
           >
             <span class="size-2 rounded-full" :style="{ backgroundColor: speakerColor(l, speakerOrder) }" />
@@ -372,8 +493,20 @@ const saved = computed(() =>
       </div>
 
       <div class="min-h-0 flex-1 overflow-y-auto px-6 py-3">
+        <template v-for="row in rows" :key="row.kind === 'seg' ? row.seg.id : `gap-${row.gap.start}`">
         <div
-          v-for="s in shown"
+          v-if="row.kind === 'break'"
+          class="text-muted-foreground my-2 flex items-center gap-3 px-2 text-xs"
+        >
+          <span class="h-px flex-1 border-t border-dashed" />
+          <button class="hover:text-primary flex items-center gap-1 tabular-nums" title="Jump to the end of the pause" @click="seek(row.gap.end)">
+            <PauseCircle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} pause · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}
+          </button>
+          <span class="h-px flex-1 border-t border-dashed" />
+        </div>
+        <div
+          v-else
+          v-for="s in [row.seg]"
           :id="`seg-${s.id}`"
           :key="s.id"
           class="group grid grid-cols-[64px_120px_1fr] gap-3 rounded-lg px-2 py-1.5"
@@ -383,7 +516,7 @@ const saved = computed(() =>
             {{ formatTime(s.start) }}
           </button>
           <DropdownMenu>
-            <DropdownMenuTrigger as-child>
+            <DropdownMenuTrigger as-child :disabled="readOnly">
               <button class="flex h-fit items-center gap-1.5 truncate pt-0.5 text-left text-xs font-medium">
                 <span class="size-2 shrink-0 rounded-full" :style="{ backgroundColor: speakerColor(s.speaker, speakerOrder) }" />
                 <span class="truncate">{{ speakerName(s.speaker) }}</span>
@@ -408,11 +541,13 @@ const saved = computed(() =>
           <p
             v-else
             class="cursor-text text-sm leading-relaxed"
-            title="Double-click to edit"
-            @dblclick="editing = { id: s.id, text: s.text }"
+            :class="readOnly ? 'cursor-auto' : ''"
+            :title="readOnly ? '' : 'Double-click to edit'"
+            @dblclick="!readOnly && (editing = { id: s.id, text: s.text })"
             v-html="highlightHtml(s.text, find)"
           />
         </div>
+        </template>
       </div>
     </template>
 

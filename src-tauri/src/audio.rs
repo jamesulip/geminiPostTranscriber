@@ -184,6 +184,14 @@ async fn ffmpeg(args: &[&str]) -> Result<String> {
     Ok(stderr)
 }
 
+/// `creation_time` metadata tag (set by phones, voice recorders, cameras).
+pub fn parse_creation_time(stderr: &str) -> Option<String> {
+    let re = Regex::new(r"(?m)^\s*creation_time\s*:\s*(\S+)").unwrap();
+    let v = re.captures(stderr)?[1].to_string();
+    // Ignore placeholder epochs some encoders write.
+    (!v.starts_with("1970") && !v.starts_with("1904")).then_some(v)
+}
+
 fn parse_duration(stderr: &str) -> Option<f64> {
     let re = Regex::new(r"Duration:\s*(\d+):(\d+):([\d.]+)").unwrap();
     let c = re.captures(stderr)?;
@@ -212,6 +220,7 @@ pub struct Prepared {
     pub processed_duration: f64,
     pub map: TimeMap,
     pub chunks: Vec<Chunk>,
+    pub recorded_at: Option<String>,
 }
 
 pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> Result<Prepared> {
@@ -222,7 +231,9 @@ pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> 
     let input_s = input.to_string_lossy().to_string();
 
     // 1. Normalize to 16 kHz mono PCM.
-    ffmpeg(&["-y", "-i", &input_s, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", &norm_s]).await?;
+    let probe = ffmpeg(&["-y", "-i", &input_s, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", &norm_s]).await?;
+    // Only look at the input section, not the output's metadata.
+    let recorded_at = parse_creation_time(probe.split("Output #0").next().unwrap_or(&probe));
 
     // 2. Silence detection (also gives exact duration of normalized audio).
     let af = format!("silencedetect=noise={}dB:d={}", opts.silence_threshold_db, opts.silence_min_duration);
@@ -302,7 +313,7 @@ pub async fn preprocess(input: &Path, work: &Path, opts: &PreprocessOptions) -> 
         chunks.push(Chunk { path, offset: c.start, duration: c.end - c.start });
     }
 
-    Ok(Prepared { original_duration: total, processed_duration, map, chunks })
+    Ok(Prepared { original_duration: total, processed_duration, map, chunks, recorded_at })
 }
 
 #[cfg(test)]
@@ -321,6 +332,14 @@ mod tests {
                    [silencedetect @ 0x1] silence_end: 12.75 | silence_duration: 2.5\n\
                    [silencedetect @ 0x1] silence_start: 19.0\n";
         assert_eq!(parse_silences(log, 20.0), vec![iv(0.0, 1.5), iv(10.25, 12.75), iv(19.0, 20.0)]);
+    }
+
+    #[test]
+    fn parses_creation_time() {
+        let log = "Input #0, mov,mp4,m4a, from 'memo.m4a':\n  Metadata:\n    major_brand     : M4A\n    creation_time   : 2026-09-30T02:15:04.000000Z\n";
+        assert_eq!(parse_creation_time(log).as_deref(), Some("2026-09-30T02:15:04.000000Z"));
+        assert_eq!(parse_creation_time("    creation_time   : 1970-01-01T00:00:00.000000Z"), None);
+        assert_eq!(parse_creation_time("Duration: 00:00:01.00"), None);
     }
 
     #[test]

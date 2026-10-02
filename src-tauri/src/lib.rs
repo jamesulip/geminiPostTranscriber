@@ -98,6 +98,11 @@ fn start_transcription(app: AppHandle, state: State<AppState>, path: String, opt
         .clone()
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| src.file_stem().map(|f| f.to_string_lossy().to_string()).unwrap_or_default());
+    // Fallback recording date: the file's modification time (refined later from metadata).
+    let recorded_at = std::fs::metadata(&src)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339());
     let s = settings::load(&state.settings_path());
     let model = options
         .model
@@ -118,6 +123,7 @@ fn start_transcription(app: AppHandle, state: State<AppState>, path: String, opt
                 provider: &options.provider_id,
                 model: &model,
                 language: options.language.as_deref().filter(|l| !l.is_empty()),
+                recorded_at: recorded_at.as_deref(),
                 tag_ids: &options.tag_ids,
             },
         )
@@ -133,12 +139,8 @@ fn retranscribe(app: AppHandle, state: State<AppState>, id: String, options: job
     let audio_path = {
         let db = state.db.lock().unwrap();
         let t = db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?;
+        // Provider/model/language are only updated once the new version succeeds.
         db::set_status(&db, &id, "processing", None).map_err(err)?;
-        db.execute(
-            "UPDATE transcripts SET provider = ?2, model = COALESCE(?3, model) WHERE id = ?1",
-            rusqlite::params![id, options.provider_id, options.model.as_deref().filter(|m| !m.is_empty())],
-        )
-        .map_err(err)?;
         PathBuf::from(t.audio_path)
     };
     spawn_job(&app, &state, id, None, audio_path, options)
@@ -201,10 +203,47 @@ fn search(state: State<AppState>, query: String) -> CmdResult<Vec<db::SearchHit>
     db::search(&state.db.lock().unwrap(), &query, 50).map_err(err)
 }
 
+/// Export the current version, or an archived one when `version_id` is given.
 #[tauri::command]
-fn export_transcript(state: State<AppState>, id: String, format: String, path: String) -> CmdResult<()> {
-    let t = db::get_transcript(&state.db.lock().unwrap(), &id).map_err(err)?.ok_or("Transcript not found")?;
+fn export_transcript(
+    state: State<AppState>,
+    id: String,
+    format: String,
+    path: String,
+    version_id: Option<i64>,
+) -> CmdResult<()> {
+    let db = state.db.lock().unwrap();
+    let mut t = db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?;
+    if let Some(vid) = version_id {
+        let v = db::get_version(&db, vid).map_err(err)?.ok_or("Version not found")?;
+        t.segments = v.segments;
+        t.speakers = v.speakers;
+        t.summary.model = v.info.model;
+        t.summary.provider = v.info.provider;
+        t.summary.language = v.info.language;
+        t.summary.version = v.info.number;
+    }
     std::fs::write(path, export::render(&t, &format)).map_err(err)
+}
+
+#[tauri::command]
+fn list_versions(state: State<AppState>, id: String) -> CmdResult<Vec<db::VersionInfo>> {
+    db::list_versions(&state.db.lock().unwrap(), &id).map_err(err)
+}
+
+#[tauri::command]
+fn get_version(state: State<AppState>, version_id: i64) -> CmdResult<Option<db::VersionDetail>> {
+    db::get_version(&state.db.lock().unwrap(), version_id).map_err(err)
+}
+
+#[tauri::command]
+fn restore_version(state: State<AppState>, version_id: i64) -> CmdResult<()> {
+    db::restore_version(&mut state.db.lock().unwrap(), version_id).map_err(err)
+}
+
+#[tauri::command]
+fn delete_version(state: State<AppState>, version_id: i64) -> CmdResult<()> {
+    db::delete_version(&state.db.lock().unwrap(), version_id).map_err(err)
 }
 
 #[tauri::command]
@@ -293,6 +332,10 @@ pub fn run() {
             update_segment,
             search,
             export_transcript,
+            list_versions,
+            get_version,
+            restore_version,
+            delete_version,
             usage_summary,
             known_price,
             list_folders,

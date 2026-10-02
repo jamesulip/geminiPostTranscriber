@@ -34,6 +34,24 @@ impl std::ops::AddAssign for TokenUsage {
 pub struct Transcription {
     pub segments: Vec<Segment>,
     pub usage: TokenUsage,
+    /// Language detected by the provider, if reported (e.g. "english" or "en-US").
+    pub language: Option<String>,
+}
+
+/// Find a detected-language field anywhere in a response.
+pub fn extract_language(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => {
+            for key in ["language", "language_code", "detected_language", "languageCode"] {
+                if let Some(l) = m.get(key).and_then(|x| x.as_str()).filter(|l| !l.trim().is_empty()) {
+                    return Some(l.trim().to_string());
+                }
+            }
+            m.values().find_map(extract_language)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(extract_language),
+        _ => None,
+    }
 }
 
 /// Find a usage block in a provider response. Handles OpenAI (`usage.input_tokens`),
@@ -92,7 +110,7 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
                 tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
             }
             other => {
-                return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), usage: t.usage })
+                return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), ..t })
             }
         }
     }
@@ -176,5 +194,8 @@ mod tests {
         let i = extract_usage(&json!({"steps": [{"usage": {"total_input_tokens": 5, "total_output_tokens": 1}}]}));
         assert_eq!(i, TokenUsage { input_tokens: 5, output_tokens: 1 });
         assert_eq!(extract_usage(&json!({"text": "x", "duration": 3.0})), TokenUsage::default());
+        assert_eq!(extract_language(&json!({"text": "x", "language": "english"})).as_deref(), Some("english"));
+        assert_eq!(extract_language(&json!({"steps": [{"language_code": "fil-PH"}]})).as_deref(), Some("fil-PH"));
+        assert_eq!(extract_language(&json!({"text": "x"})), None);
     }
 }

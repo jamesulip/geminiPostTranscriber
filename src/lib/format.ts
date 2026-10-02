@@ -50,3 +50,23 @@ export function formatMinutes(seconds: number): string {
 export function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
+
+export function formatDay(iso: string): string {
+  return new Date(iso).toLocaleDateString(undefined, { dateStyle: "medium" });
+}
+
+const languageNames = new Intl.DisplayNames(undefined, { type: "language" });
+
+/** "en", "en-US", "fil" → display name; full names like "english" are capitalized. */
+export function formatLanguage(lang: string | null): string {
+  if (!lang) return "Auto";
+  const l = lang.trim();
+  if (/^[a-z]{2,3}([-_][a-z0-9]{2,8})*$/i.test(l)) {
+    try {
+      return languageNames.of(l.replace("_", "-")) ?? l;
+    } catch {
+      return l;
+    }
+  }
+  return l.charAt(0).toUpperCase() + l.slice(1);
+}

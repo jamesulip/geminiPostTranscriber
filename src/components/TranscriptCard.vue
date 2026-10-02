@@ -3,7 +3,8 @@ import { computed } from "vue";
 import { AlertCircle, Folder, Loader2 } from "@lucide/vue";
 import { Progress } from "@/components/ui/progress";
 import type { TranscriptSummary } from "@/lib/api";
-import { formatDate, formatDuration } from "@/lib/format";
+import { formatDuration } from "@/lib/format";
+import TranscriptMeta from "./TranscriptMeta.vue";
 import { useJobs } from "@/stores/jobs";
 import { useLibrary } from "@/stores/library";
 
@@ -21,9 +22,9 @@ const saved = computed(() =>
     :to="{ name: 'transcript', params: { id: t.id } }"
     class="hover:border-primary/40 hover:bg-accent/30 bg-card flex flex-col gap-2 rounded-xl border p-4 transition-colors"
   >
-    <div class="flex items-start justify-between gap-3">
+    <div class="grid gap-1">
       <h3 class="line-clamp-1 font-medium">{{ t.title }}</h3>
-      <span class="text-muted-foreground shrink-0 text-xs tabular-nums">{{ formatDuration(t.duration) }}</span>
+      <TranscriptMeta :t="t" />
     </div>
 
     <div v-if="t.status === 'processing'" class="grid gap-1.5">
@@ -45,10 +46,9 @@ const saved = computed(() =>
         class="rounded-full px-2 py-0.5 text-[11px] text-white"
         :style="{ backgroundColor: tag.color }"
       >{{ tag.name }}</span>
-      <span class="ml-auto">{{ formatDate(t.created_at) }}</span>
     </div>
     <div v-if="saved !== null && t.status === 'done'" class="text-muted-foreground text-[11px]">
-      {{ t.provider }} · {{ t.model }} · sent {{ formatDuration(t.processed_duration) }} ({{ saved }}% less)
+      {{ t.provider }} · sent {{ formatDuration(t.processed_duration) }} ({{ saved }}% less)
     </div>
   </RouterLink>
 </template>

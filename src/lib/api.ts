@@ -53,6 +53,31 @@ export interface TranscriptSummary {
   created_at: string;
   tags: Tag[];
   preview: string | null;
+  /** When the audio was recorded (file metadata or modification time). */
+  recorded_at: string | null;
+  /** Requested language, else the one detected by the provider. */
+  language: string | null;
+  /** Number of the current transcription version. */
+  version: number;
+  /** When the current version was produced. */
+  transcribed_at: string | null;
+}
+
+/** An archived (non-current) transcription. */
+export interface VersionInfo {
+  id: number;
+  number: number;
+  provider: string;
+  model: string;
+  language: string | null;
+  processed_duration: number;
+  transcribed_at: string;
+  segment_count: number;
+}
+
+export interface VersionDetail extends VersionInfo {
+  segments: SegmentRow[];
+  speakers: Speaker[];
 }
 
 export interface SegmentRow {
@@ -112,7 +137,6 @@ export interface UsageSummary {
 
 export interface TranscriptDetail extends TranscriptSummary {
   audio_path: string;
-  language: string | null;
   segments: SegmentRow[];
   speakers: Speaker[];
   usage: UsageTotals;
@@ -177,8 +201,12 @@ export const api = {
   updateSegment: (segmentId: number, text: string, speaker: string | null) =>
     invoke<void>("update_segment", { segmentId, text, speaker }),
   search: (query: string) => invoke<SearchHit[]>("search", { query }),
-  exportTranscript: (id: string, format: ExportFormat, path: string) =>
-    invoke<void>("export_transcript", { id, format, path }),
+  exportTranscript: (id: string, format: ExportFormat, path: string, versionId: number | null = null) =>
+    invoke<void>("export_transcript", { id, format, path, versionId }),
+  listVersions: (id: string) => invoke<VersionInfo[]>("list_versions", { id }),
+  getVersion: (versionId: number) => invoke<VersionDetail | null>("get_version", { versionId }),
+  restoreVersion: (versionId: number) => invoke<void>("restore_version", { versionId }),
+  deleteVersion: (versionId: number) => invoke<void>("delete_version", { versionId }),
 
   usageSummary: () => invoke<UsageSummary>("usage_summary"),
   knownPrice: (model: string) => invoke<number>("known_price", { model }),

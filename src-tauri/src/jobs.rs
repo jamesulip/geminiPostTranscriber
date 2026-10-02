@@ -59,6 +59,8 @@ fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Int
 /// What was actually sent to the provider, for usage/cost accounting.
 #[derive(Default)]
 struct Meter {
+    /// First language reported by the provider.
+    language: Option<String>,
     /// original / processed duration, to attribute original minutes to sent chunks.
     ratio: f64,
     sent_seconds: f64,
@@ -67,7 +69,10 @@ struct Meter {
 }
 
 impl Meter {
-    fn add(&mut self, seconds: f64, tokens: TokenUsage) {
+    fn add(&mut self, seconds: f64, tokens: TokenUsage, language: Option<String>) {
+        if self.language.is_none() {
+            self.language = language;
+        }
         self.sent_seconds += seconds;
         self.requests += 1;
         self.tokens += tokens;
@@ -86,7 +91,11 @@ pub async fn run(app: AppHandle, job: Job) {
     {
         let db = state.db.lock().unwrap();
         let status = if error.is_some() { "error" } else { "done" };
-        let _ = db::set_status(&db, &job.id, status, error.as_deref());
+        let _ = match &error {
+            // Keeps the transcript usable when a re-transcription fails and a previous version exists.
+            Some(e) => db::mark_failed(&db, &job.id, e),
+            None => db::set_status(&db, &job.id, "done", None),
+        };
         // Record whatever was billed, including partial work from failed/cancelled jobs.
         let m = meter.lock().unwrap();
         if m.requests > 0 {
@@ -154,7 +163,8 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
     .await?;
     {
         let db = state.db.lock().unwrap();
-        db::set_durations(&db, id, prepared.original_duration, prepared.processed_duration)?;
+        db::set_duration(&db, id, prepared.original_duration)?;
+        db::set_recording_meta(&db, id, prepared.recorded_at.as_deref(), None)?;
     }
     meter.lock().unwrap().ratio = prepared.original_duration / prepared.processed_duration.max(0.001);
     let n = prepared.chunks.len();
@@ -200,7 +210,7 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
                         previous_text: "",
                     };
                     let t = providers::transcribe(&client, &cfg, &req).await?;
-                    meter.lock().unwrap().add(chunk.duration, t.usage);
+                    meter.lock().unwrap().add(chunk.duration, t.usage, t.language);
                     let segs = t.segments;
                     let k = done.fetch_add(1, Ordering::Relaxed) + 1;
                     let p = 0.15 + 0.8 * (k as f64 / n as f64);
@@ -221,7 +231,7 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
             }
             let req = Request { path: &chunk.path, duration: chunk.duration, language, known_speakers: &speakers, previous_text: &previous };
             let t = providers::transcribe(client, cfg, &req).await?;
-            meter.lock().unwrap().add(chunk.duration, t.usage);
+            meter.lock().unwrap().add(chunk.duration, t.usage, t.language);
             let segs = t.segments;
             for s in &segs {
                 if let Some(sp) = &s.speaker {
@@ -243,8 +253,20 @@ async fn execute(app: &AppHandle, job: &Job, work: &std::path::Path, meter: &Mut
     if merged.is_empty() {
         bail!("The provider returned no speech");
     }
+    let language = meter.lock().unwrap().language.clone();
     let mut db = state.db.lock().unwrap();
-    db::replace_segments(&mut db, id, &merged)?;
+    db::commit_version(
+        &mut db,
+        id,
+        &merged,
+        &db::CompletedVersion {
+            provider: &job.provider.id,
+            model: &job.provider.model,
+            language: o.language.as_deref().filter(|l| !l.trim().is_empty()),
+            detected_language: language.as_deref(),
+            processed_duration: prepared.processed_duration,
+        },
+    )?;
     Ok(())
 }
 

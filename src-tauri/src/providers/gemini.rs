@@ -1,7 +1,7 @@
 //! Gemini. `*-transcribe` models use the Interactions API (native diarization and word
 //! timestamps); other models fall back to `generateContent` with a JSON schema.
 
-use super::{check, extract_usage, parse_time, Request, Segment, Transcription};
+use super::{check, extract_language, extract_usage, parse_time, Request, Segment, Transcription};
 use crate::settings::ProviderConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
@@ -143,7 +143,7 @@ async fn interact(
             .await?;
         v = check(r).await?.json().await?;
     }
-    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v) })
+    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v) })
 }
 
 #[derive(Debug)]
@@ -301,7 +301,7 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
         .as_array()
         .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
         .unwrap_or_default();
-    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v) })
+    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v), language: None })
 }
 
 fn parse_json_segments(text: &str) -> Result<Vec<Segment>> {

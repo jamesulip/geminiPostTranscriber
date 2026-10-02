@@ -55,12 +55,25 @@ pub fn render(t: &TranscriptDetail, format: &str) -> String {
                 .map(|s| serde_json::json!({"start": s.start, "end": s.end, "speaker": who(&s.speaker), "text": s.text}))
                 .collect();
             out = serde_json::to_string_pretty(&serde_json::json!({
-                "title": t.summary.title, "duration": t.summary.duration, "segments": segs
+                "title": t.summary.title,
+                "duration": t.summary.duration,
+                "recorded_at": t.summary.recorded_at,
+                "transcribed_at": t.summary.created_at,
+                "language": t.summary.language,
+                "provider": t.summary.provider,
+                "model": t.summary.model,
+                "version": t.summary.version,
+                "segments": segs
             }))
             .unwrap_or_default();
         }
         "md" => {
             out += &format!("# {}\n\n", t.summary.title);
+            let date = t.summary.recorded_at.as_deref().unwrap_or(&t.summary.created_at);
+            out += &format!("- **Recorded:** {}\n", date.get(..10).unwrap_or(date));
+            out += &format!("- **Duration:** {}\n", clock(t.summary.duration));
+            out += &format!("- **Language:** {}\n", t.summary.language.as_deref().unwrap_or("auto"));
+            out += &format!("- **Model:** {} ({}) · version {}\n\n", t.summary.model, t.summary.provider, t.summary.version);
             let mut last: Option<String> = None;
             for s in &t.segments {
                 let w = who(&s.speaker);

@@ -1,6 +1,6 @@
 //! OpenAI-compatible `/audio/transcriptions` (OpenAI, Groq, local servers, ...).
 
-use super::{check, extract_usage, parse_time, Request, Segment, Transcription};
+use super::{check, extract_language, extract_usage, parse_time, Request, Segment, Transcription};
 use crate::settings::ProviderConfig;
 use anyhow::{Context, Result};
 use reqwest::multipart::{Form, Part};
@@ -33,7 +33,7 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
     let resp = client.post(url).bearer_auth(&cfg.api_key).multipart(form).send().await?;
     let body: Value = check(resp).await?.json().await.context("invalid JSON from provider")?;
-    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body) })
+    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body), language: extract_language(&body) })
 }
 
 fn parse(body: &Value, duration: f64) -> Vec<Segment> {
