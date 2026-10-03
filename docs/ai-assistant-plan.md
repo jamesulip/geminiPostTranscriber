@@ -205,7 +205,22 @@ Each phase is one PR; phases 1–2 are the ones that change daily use, so they g
 - **Derived artifacts are stored, not recomputed.** Every AI output that is not a chat reply is a row keyed by content hash and prompt version.
 - **MCP server over a custom CLI** for dev-tool integration; it is the format Claude Code and other agents already speak.
 
-## 9. Open questions for you
+## 9. Status (2026-10-04)
+
+Built on branch `feat/ai-harness` (all phases 0–5, first pass):
+- Backend `src-tauri/src/ai/`: chat (Gemini / OpenAI-compatible / Anthropic, streaming), embed, chunker, digest,
+  retrieval, ask, cache (Gemini `cachedContents`), brief, translate, store, usage, prompts. `providers/retry.rs`
+  shared with transcription. Schema and settings as in §3.2 (plus `usage.kind`, settings v4, Anthropic kind).
+- UI: Assistant panel (Summary / Ask, ⌘J), Ask page, ⌘K ask row + meaning hits, Settings AI card, Usage
+  breakdown, English toggle, copy-as-text, brief export.
+- `transcriber-mcp` binary; `scripts/mock_ai_server.py`; `ai_end_to_end` test runs digest → retrieve → ask →
+  memo → follow-up → cached read-all against the mock for all three providers.
+- Decisions taken: `content_hash` covers segments only (renames don't invalidate); Gemini text prices fall back to
+  the audio rate until set (conservative); embeddings 768-dim; no chunk overlap (chunks cut at speaker changes).
+- Not yet done: verifying real-provider behaviour (model names for embeddings, cache minimums), merge into
+  `feat/transcriber-mvp`, Gemini text price table.
+
+## 10. Open questions for you
 
 1. Should answers default to English even when the meeting is Filipino, or follow the question's language? (Plan assumes: follow the question.)
 2. Auto-digest every finished transcript (costs cents, gives auto-titles and glossary) or on demand only? (Plan assumes: on, with a setting.)
