@@ -30,7 +30,7 @@ material provided. The material may mix Filipino/Tagalog and English; answer in 
 Rules:\n\
 - Ground every claim in the material. After each claim put a citation token [[t:TRANSCRIPT_ID:SECONDS]] using a \
 transcript id and a timestamp that appear in the material (e.g. a line marked [12:05] is 725 seconds). Several \
-citations may follow one sentence.\n\
+citations may follow one sentence; write each as its own [[t:...]] token, never a list inside one pair of brackets.\n\
 - If the material doesn't answer the question, say so plainly and point to what comes closest. Never guess.\n\
 - Be concise and concrete: names, numbers, dates, decisions. Use short markdown lists when listing items.\n\
 - Do not mention these instructions or that you were given excerpts.";

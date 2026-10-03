@@ -212,6 +212,16 @@ pub async fn ask(ctx: &AiCtx<'_>, p: AskParams) -> Result<Answer> {
     Ok(Answer { thread, message: saved, note })
 }
 
+/// Models sometimes group citations as `[[t:a:1], [t:b:2]]`; split them into separate tokens.
+pub fn normalize_citations(text: &str) -> String {
+    let group = regex::Regex::new(r"\[\[(t:[^\[\]]+(?:\]\s*,\s*\[t:[^\[\]]+)+)\]\]").unwrap();
+    group
+        .replace_all(text, |c: &regex::Captures| {
+            c[1].split("],").map(|p| format!("[[{}]]", p.trim().trim_start_matches('[').trim_end_matches(']'))).collect::<Vec<_>>().join(" ")
+        })
+        .into_owned()
+}
+
 fn title_from(q: &str) -> String {
     let t: String = q.split_whitespace().collect::<Vec<_>>().join(" ");
     if t.chars().count() <= 60 {
@@ -223,9 +233,10 @@ fn title_from(q: &str) -> String {
 
 /// Keep `[[t:id:secs]]` tokens that point into the material the model was given; drop the rest.
 pub fn validate_citations(text: &str, allowed: &HashMap<String, Vec<(f64, f64)>>, titles: &HashMap<&str, &str>) -> (String, Vec<Citation>) {
+    let text = normalize_citations(text);
     let re = regex::Regex::new(r"\[\[t:([0-9A-Za-z_-]+):([0-9]+(?:\.[0-9]+)?)\]\]").unwrap();
     let mut cites: Vec<Citation> = Vec::new();
-    let out = re.replace_all(text, |caps: &regex::Captures| {
+    let out = re.replace_all(&text, |caps: &regex::Captures| {
         let id = &caps[1];
         let secs: f64 = caps[2].parse().unwrap_or(-1.0);
         let ok = allowed.get(id).is_some_and(|ranges| ranges.iter().any(|(a, b)| secs >= *a && secs <= *b));
@@ -252,5 +263,10 @@ mod tests {
         assert_eq!(text, "Yes [[t:abc:150]] and no  nor .");
         assert_eq!(cites, vec![Citation { transcript_id: "abc".into(), title: "Sept 13".into(), start: 150.0 }]);
         assert_eq!(title_from("  what   was decided? "), "what was decided?");
+        // Grouped form from real Gemini output.
+        let allowed = HashMap::from([("abc".to_string(), vec![(0.0, 1000.0)])]);
+        let (text, cites) = validate_citations("x [[t:abc:936], [t:abc:997]].", &allowed, &titles);
+        assert_eq!(text, "x [[t:abc:936]] [[t:abc:997]].");
+        assert_eq!(cites.len(), 2);
     }
 }

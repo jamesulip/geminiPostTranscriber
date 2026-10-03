@@ -648,7 +648,7 @@ const saved = computed(() =>
         @play="playing = true"
         @pause="playing = false"
       />
-      <div class="mb-3 flex items-center gap-3">
+      <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1">
         <Button size="icon" class="rounded-full" @click="togglePlay">
           <Pause v-if="playing" /><Play v-else />
         </Button>
@@ -686,7 +686,7 @@ const saved = computed(() =>
           title="Show an English translation under each line (made once by the AI assistant)"
           @click="toggleEnglish"
         ><Loader2 v-if="showEnglish && translating" class="animate-spin" /><Languages v-else /> English</Button>
-        <span class="text-muted-foreground ml-auto text-xs">
+        <span class="text-muted-foreground ml-auto text-xs whitespace-nowrap">
           {{ t.provider }}
           <template v-if="saved !== null"> · {{ formatDuration(t.duration) }} → {{ formatDuration(t.processed_duration) }} sent ({{ saved }}% less)</template>
           <template v-if="t.usage.jobs">

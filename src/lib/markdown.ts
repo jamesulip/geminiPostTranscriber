@@ -3,6 +3,11 @@
 import { formatTime } from "./format";
 
 const CITE = /\[\[t:([0-9A-Za-z_-]+):([0-9]+(?:\.[0-9]+)?)\]\]/g;
+/** Grouped form some models produce: `[[t:a:1], [t:b:2]]` → separate tokens. */
+const GROUPED = /\[\[(t:[^[\]]+(?:\]\s*,\s*\[t:[^[\]]+)+)\]\]/g;
+function normalizeCitations(s: string): string {
+  return s.replace(GROUPED, (_m, inner: string) => inner.split("],").map((p) => `[[${p.trim().replace(/^\[/, "").replace(/\]$/, "")}]]`).join(" "));
+}
 
 export function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -25,7 +30,7 @@ function inline(s: string, currentId: string | undefined, titles: Record<string,
 }
 
 export function renderMarkdown(md: string, currentId?: string, titles: Record<string, string> = {}): string {
-  const lines = md.replace(/\r/g, "").split("\n");
+  const lines = normalizeCitations(md).replace(/\r/g, "").split("\n");
   const html: string[] = [];
   let list: "ul" | "ol" | null = null;
   let para: string[] = [];
@@ -76,7 +81,7 @@ export function renderMarkdown(md: string, currentId?: string, titles: Record<st
 
 /** Strip citation tokens for plain-text uses (copy, titles). */
 export function stripCitations(md: string): string {
-  return md.replace(CITE, "").replace(/[ \t]+([.,;:!?])/g, "$1").replace(/[ \t]{2,}/g, " ");
+  return normalizeCitations(md).replace(CITE, "").replace(/[ \t]+([.,;:!?])/g, "$1").replace(/[ \t]{2,}/g, " ");
 }
 
 /** Resolve a click inside rendered markdown to a citation, if one was clicked. */
