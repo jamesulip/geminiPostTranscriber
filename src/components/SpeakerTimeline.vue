@@ -27,6 +27,26 @@ const scale = computed(() => new TimelineScale(total.value, props.collapse ? gap
 const pct = (t: number) => `${scale.value.pos(t) * 100}%`;
 const span = (a: number, b: number) => `${(scale.value.pos(b) - scale.value.pos(a)) * 100}%`;
 
+/**
+ * Segment bars per lane, computed once per transcript/scale/search. Rendered under v-memo so
+ * playhead and hover updates don't re-render thousands of bars in long recordings.
+ */
+const bars = computed(() =>
+  lanes.value.map((l) => ({
+    key: l ?? "unknown",
+    color: speakerColor(l, props.speakerOrder),
+    segs: props.segments
+      .filter((s) => s.speaker === l)
+      .map((s) => ({
+        id: s.id,
+        left: pct(s.start),
+        width: `max(2px, ${span(s.start, s.end)})`,
+        dim: props.matches.size > 0 && !props.matches.has(s.id),
+        title: `${formatTime(s.start)} ${s.text}`,
+      })),
+  })),
+);
+
 const track = ref<HTMLElement | null>(null);
 const hover = ref<number | null>(null);
 
@@ -58,14 +78,19 @@ function timeAt(e: MouseEvent) {
         @mousemove="hover = timeAt($event)"
         @mouseleave="hover = null"
       >
-        <div v-for="l in lanes" :key="l ?? 'unknown'" class="relative h-6 border-b border-white/40 last:border-0">
+        <div
+          v-for="lane in bars"
+          :key="lane.key"
+          v-memo="[lane]"
+          class="relative h-6 border-b border-white/40 last:border-0"
+        >
           <div
-            v-for="s in segments.filter((x) => x.speaker === l)"
-            :key="s.id"
+            v-for="b in lane.segs"
+            :key="b.id"
             class="absolute top-1 bottom-1 rounded-sm"
-            :class="matches.size && !matches.has(s.id) ? 'opacity-25' : 'opacity-90'"
-            :style="{ left: pct(s.start), width: `max(2px, ${span(s.start, s.end)})`, backgroundColor: speakerColor(l, speakerOrder) }"
-            :title="`${formatTime(s.start)} ${s.text}`"
+            :class="b.dim ? 'opacity-25' : 'opacity-90'"
+            :style="{ left: b.left, width: b.width, backgroundColor: lane.color }"
+            :title="b.title"
           />
         </div>
         <!-- Breaks -->

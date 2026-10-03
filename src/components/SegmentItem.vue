@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from "vue";
+import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { Textarea } from "@/components/ui/textarea";
 import type { SegmentRow } from "@/lib/api";
 import { formatTime } from "@/lib/format";
@@ -36,12 +36,21 @@ watch(
   },
   { immediate: true },
 );
+// The list is virtualized, so scrolling a row out of view unmounts it: keep an unsaved edit, and
+// hand focus back to the page so keyboard shortcuts (space, arrows) keep working.
+const root = ref<HTMLElement | null>(null);
+onBeforeUnmount(() => {
+  if (props.editing) emit("save", draft.value);
+  if (root.value?.contains(document.activeElement)) {
+    root.value.parentElement?.closest<HTMLElement>("[tabindex]")?.focus({ preventScroll: true });
+  }
+});
 </script>
 
 <template>
   <div
-    :id="`seg-${seg.id}`"
-    class="segment-row grid grid-cols-[64px_120px_1fr] gap-3 rounded-lg px-2 py-1.5"
+    ref="root"
+    class="grid grid-cols-[64px_120px_1fr] gap-3 rounded-lg px-2 py-1.5"
     :class="active ? 'bg-primary/10' : 'hover:bg-accent/40'"
   >
     <button class="text-muted-foreground hover:text-primary pt-0.5 text-left text-xs tabular-nums" @click="emit('seek', seg.start)">
@@ -74,11 +83,3 @@ watch(
     />
   </div>
 </template>
-
-<style scoped>
-/* Let the browser skip layout/paint for off-screen rows in long transcripts. */
-.segment-row {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 36px;
-}
-</style>

@@ -6,7 +6,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
-  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, PauseCircle, Play,
+  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, Play,
   Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, Wrench,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -21,7 +21,7 @@ import FolderSelect from "@/components/FolderSelect.vue";
 import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
-import SegmentItem from "@/components/SegmentItem.vue";
+import TranscriptList from "@/components/TranscriptList.vue";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
 import PromptDialog from "@/components/PromptDialog.vue";
@@ -29,7 +29,6 @@ import {
   api, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail, type VersionDetail, type VersionInfo,
 } from "@/lib/api";
 import { formatDate, formatDuration, formatLanguage, formatTime, formatUsd, speakerColor } from "@/lib/format";
-import { BREAK_SECONDS, findGaps, formatGap, type Gap } from "@/lib/breaks";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
 import { useJobs } from "@/stores/jobs";
 import { useLibrary } from "@/stores/library";
@@ -167,41 +166,7 @@ const matches = computed(() => {
 });
 const filtering = computed(() => onlyMatches.value && !!find.value.trim());
 const shown = computed(() => (filtering.value ? segments.value.filter((s) => matches.value.has(s.id)) : segments.value));
-
-/** Segment list with "pause" dividers wherever speech stops for a while (not while filtering). */
-type Row = { kind: "seg"; seg: SegmentRow } | { kind: "break"; gap: Gap };
-const rows = computed<Row[]>(() => {
-  const segs = shown.value;
-  if (filtering.value) return segs.map((seg) => ({ kind: "seg", seg }));
-  const gaps = findGaps(segs, shownDuration.value, BREAK_SECONDS);
-  const out: Row[] = [];
-  let g = 0;
-  for (const seg of segs) {
-    while (g < gaps.length && gaps[g].end <= seg.start + 1e-6) out.push({ kind: "break", gap: gaps[g++] });
-    out.push({ kind: "seg", seg });
-  }
-  while (g < gaps.length) out.push({ kind: "break", gap: gaps[g++] });
-  return out;
-});
-
-/** Render long transcripts progressively so the page opens instantly. */
-const RENDER_STEP = 400;
-const renderLimit = ref(RENDER_STEP);
-const visibleRows = computed(() => rows.value.slice(0, renderLimit.value));
-let growTimer: ReturnType<typeof setTimeout> | undefined;
-function growRows() {
-  clearTimeout(growTimer);
-  if (renderLimit.value >= rows.value.length) return;
-  renderLimit.value += RENDER_STEP;
-  growTimer = setTimeout(growRows, 30);
-}
-watch(() => rows.value.length, growRows, { immediate: true });
-
-/** Make sure a segment's row exists before scrolling to it. */
-function ensureRendered(segId: number) {
-  const i = rows.value.findIndex((r) => r.kind === "seg" && r.seg.id === segId);
-  if (i >= renderLimit.value) renderLimit.value = i + RENDER_STEP;
-}
+const list = ref<InstanceType<typeof TranscriptList> | null>(null);
 
 const activeId = computed(() => {
   const segs = segments.value;
@@ -213,20 +178,15 @@ const activeId = computed(() => {
   return found && currentTime.value <= found.end + 1.5 ? found.id : null;
 });
 watch(activeId, (sid) => {
-  if (sid !== null && follow.value && playing.value) {
-    ensureRendered(sid);
-    void nextTick(() => document.getElementById(`seg-${sid}`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
-  }
+  if (sid !== null && follow.value && playing.value) void list.value?.scrollToSegment(sid, true);
 });
 
 function jumpFromQuery() {
   const tq = Number(route.query.t);
   if (!Number.isNaN(tq) && route.query.t !== undefined) {
     seek(tq, false);
-    ensureRendered(Number(route.query.seg));
-    nextTick(() =>
-      document.getElementById(`seg-${route.query.seg}`)?.scrollIntoView({ block: "center" }),
-    );
+    // The list may only mount on the next render (right after loading).
+    void nextTick(() => list.value?.scrollToSegment(Number(route.query.seg)));
   }
 }
 
@@ -278,6 +238,8 @@ async function renameSpeaker(name: string) {
 }
 
 async function saveSegment(seg: SegmentRow, text: string) {
+  // Ignore a second save from the same edit (e.g. blur after Enter, or after Esc cancelled it).
+  if (editingId.value !== seg.id) return;
   editingId.value = null;
   const next = text.trim();
   if (!next || seg.text === next) return;
@@ -619,35 +581,24 @@ const saved = computed(() =>
         </div>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-y-auto px-6 py-3">
-        <template v-for="row in visibleRows" :key="row.kind === 'seg' ? row.seg.id : `gap-${row.gap.start}`">
-          <div v-if="row.kind === 'break'" class="text-muted-foreground my-2 flex items-center gap-3 px-2 text-xs">
-            <span class="h-px flex-1 border-t border-dashed" />
-            <button class="hover:text-primary flex items-center gap-1 tabular-nums" title="Jump to the end of the pause" @click="seek(row.gap.end)">
-              <PauseCircle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} pause · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}
-            </button>
-            <span class="h-px flex-1 border-t border-dashed" />
-          </div>
-          <SegmentItem
-            v-else
-            :seg="row.seg"
-            :speaker="speakerName(row.seg.speaker)"
-            :color="speakerColor(row.seg.speaker, speakerOrder)"
-            :active="row.seg.id === activeId"
-            :query="matches.has(row.seg.id) ? find : ''"
-            :read-only="readOnly"
-            :editing="editingId === row.seg.id"
-            @seek="seek"
-            @speaker-menu="openSpeakerMenu"
-            @edit="editingId = row.seg.id"
-            @save="(text) => saveSegment(row.seg, text)"
-            @cancel="editingId = null"
-          />
-        </template>
-        <p v-if="visibleRows.length < rows.length" class="text-muted-foreground py-4 text-center text-xs">
-          Loading {{ rows.length - visibleRows.length }} more…
-        </p>
-      </div>
+      <TranscriptList
+        ref="list"
+        :segments="shown"
+        :breaks="!filtering"
+        :duration="shownDuration"
+        :active-id="activeId"
+        :query="find"
+        :matches="matches"
+        :speaker-order="speakerOrder"
+        :names="names"
+        :read-only="readOnly"
+        :editing-id="editingId"
+        @seek="seek"
+        @speaker-menu="openSpeakerMenu"
+        @edit="(seg) => (editingId = seg.id)"
+        @save="saveSegment"
+        @cancel="editingId = null"
+      />
     </template>
 
     <div
