@@ -4,7 +4,7 @@ import { useRouter } from "vue-router";
 import { RefreshCw } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { api, type UsageSummary, type UsageTotals } from "@/lib/api";
+import { api, type UsageKind, type UsageSummary, type UsageTotals } from "@/lib/api";
 import { formatDate, formatMinutes, formatTokens, formatUsd } from "@/lib/format";
 
 const router = useRouter();
@@ -32,10 +32,16 @@ const months = computed(() => {
   }));
 });
 
+const KIND_LABEL: Record<UsageKind, string> = { transcribe: "Transcription", ai: "AI assistant", embed: "Search index" };
+const kindOf = (k: string) => KIND_LABEL[k as UsageKind] ?? k;
+
 const tiles = computed(() => {
   const d = data.value;
   if (!d) return [];
+  const aiSpend = d.by_kind.filter((k) => k.kind !== "transcribe").reduce((a, k) => a + k.cost_usd, 0);
+  const aiReqs = d.by_kind.filter((k) => k.kind !== "transcribe").reduce((a, k) => a + k.requests, 0);
   return [
+    { label: "AI assistant (all time)", value: formatUsd(aiSpend), sub: `${aiReqs} request(s) · summaries, questions, search index` },
     { label: "Spent this month", value: formatUsd(d.this_month.cost_usd), sub: `${d.this_month.jobs} job(s)` },
     { label: "Spent all time", value: formatUsd(d.all_time.cost_usd), sub: `${d.all_time.requests} request(s)` },
     {
@@ -57,14 +63,14 @@ const tiles = computed(() => {
     <header class="flex items-center border-b px-6 py-4" data-tauri-drag-region>
       <div>
         <h1 class="text-lg font-semibold">Usage</h1>
-        <p class="text-muted-foreground text-xs">Estimated from audio minutes sent × each provider's price per minute (set in Settings).</p>
+        <p class="text-muted-foreground text-xs">Transcription: audio minutes sent × price per minute, or reported tokens × token prices. AI assistant: reported tokens × text prices (Settings).</p>
       </div>
       <Button variant="outline" size="sm" class="ml-auto" @click="load"><RefreshCw /> Refresh</Button>
     </header>
 
     <div v-if="data" class="min-h-0 flex-1 overflow-y-auto p-6">
       <div class="mx-auto grid max-w-5xl gap-6">
-        <div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div class="grid grid-cols-2 gap-4 lg:grid-cols-5">
           <div v-for="t in tiles" :key="t.label" class="bg-card rounded-xl border p-4">
             <p class="text-muted-foreground text-xs">{{ t.label }}</p>
             <p class="mt-1 text-2xl font-semibold tabular-nums">{{ t.value }}</p>
@@ -96,8 +102,11 @@ const tiles = computed(() => {
                 </tr>
               </thead>
               <tbody class="tabular-nums">
-                <tr v-for="r in m.rows" :key="r.provider_name + r.model" class="border-t">
-                  <td class="truncate py-2">{{ r.provider_name }} <span class="text-muted-foreground">· {{ r.model }}</span></td>
+                <tr v-for="r in m.rows" :key="r.kind + r.provider_name + r.model" class="border-t">
+                  <td class="truncate py-2">
+                    <span v-if="r.kind !== 'transcribe'" class="bg-primary/10 text-primary mr-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium">{{ kindOf(r.kind) }}</span>
+                    {{ r.provider_name }} <span class="text-muted-foreground">· {{ r.model }}</span>
+                  </td>
                   <td class="py-2 text-right">{{ r.jobs }}</td>
                   <td class="py-2 text-right">{{ formatMinutes(r.original_seconds) }}</td>
                   <td class="py-2 text-right">{{ formatMinutes(r.sent_seconds) }}</td>
@@ -115,7 +124,7 @@ const tiles = computed(() => {
         <Card v-if="data.recent.length">
           <CardHeader>
             <CardTitle>Recent jobs</CardTitle>
-            <CardDescription>Failed or cancelled jobs still count the chunks that were sent.</CardDescription>
+            <CardDescription>Failed or cancelled jobs still count the chunks that were sent. AI rows show tokens in / out.</CardDescription>
           </CardHeader>
           <CardContent>
             <table class="w-full table-fixed text-sm">
@@ -138,10 +147,11 @@ const tiles = computed(() => {
                     >{{ r.title }}</button>
                     <span v-else class="text-muted-foreground truncate">{{ r.title }} (deleted)</span>
                     <span v-if="r.status === 'error'" class="text-destructive ml-1.5 text-xs">failed</span>
+                    <span v-if="r.kind !== 'transcribe'" class="bg-primary/10 text-primary ml-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium">{{ kindOf(r.kind) }}</span>
                   </td>
                   <td class="text-muted-foreground py-2">{{ formatDate(r.created_at) }}</td>
                   <td class="truncate py-2">{{ r.provider_name }} <span class="text-muted-foreground">· {{ r.model }}</span></td>
-                  <td class="py-2 text-right">{{ formatMinutes(r.sent_seconds) }}</td>
+                  <td class="py-2 text-right">{{ r.kind === 'transcribe' ? formatMinutes(r.sent_seconds) : `${formatTokens(r.input_tokens)} / ${formatTokens(r.output_tokens)}` }}</td>
                   <td class="py-2 text-right font-medium">{{ formatUsd(r.cost_usd) }}</td>
                 </tr>
               </tbody>

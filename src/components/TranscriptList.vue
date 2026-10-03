@@ -26,6 +26,8 @@ const props = defineProps<{
   names: Record<string, string>;
   readOnly: boolean;
   editingId: number | null;
+  /** English lines by segment idx (AI translation), when the English toggle is on. */
+  translations?: Record<number, string> | null;
 }>();
 const emit = defineEmits<{
   seek: [time: number];
@@ -126,6 +128,7 @@ defineExpose({ scrollToSegment });
             :query="matches.has(row.seg.id) ? query : ''"
             :read-only="readOnly"
             :editing="editingId === row.seg.id"
+            :translation="translations?.[row.seg.idx]"
             @seek="(time) => emit('seek', time)"
             @speaker-menu="(seg, anchor) => emit('speakerMenu', seg, anchor)"
             @edit="emit('edit', row.seg)"

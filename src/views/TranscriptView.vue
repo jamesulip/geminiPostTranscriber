@@ -25,6 +25,10 @@ import SpeakerIdDialog from "@/components/SpeakerIdDialog.vue";
 import DiarizeDialog from "@/components/DiarizeDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
+import AiPanel from "@/components/AiPanel.vue";
+import { ClipboardCopy, FileText, Languages, Sparkles } from "@lucide/vue";
+import { useAi } from "@/stores/ai";
+import { useLocalStorage } from "@vueuse/core";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
 import CompareDialog from "@/components/CompareDialog.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
@@ -89,6 +93,80 @@ function openIdentify() {
   audio.value?.pause();
   identifying.value = true;
 }
+const ai = useAi();
+
+/** English translation (AI), shown under each line when on. Made once per transcript version. */
+const showEnglish = ref(false);
+const translations = ref<Record<number, string> | null>(null);
+const translating = computed(() => ai.running[`translate:${id.value}`]);
+async function loadTranslation(): Promise<boolean> {
+  const d = (await api.aiGetDigests(id.value)).find((x) => x.kind === "translation_en");
+  if (!d || d.stale) return false;
+  try {
+    translations.value = JSON.parse(d.content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function toggleEnglish() {
+  if (showEnglish.value) {
+    showEnglish.value = false;
+    return;
+  }
+  showEnglish.value = true;
+  if (await loadTranslation()) return;
+  try {
+    await api.aiTranslate(id.value);
+    toast("Translating to English", { description: "Runs once per transcript; lines appear when it finishes." });
+  } catch (e) {
+    showEnglish.value = false;
+    toast.error("Couldn't start the translation", { description: String(e) });
+  }
+}
+watch(() => ai.digestVersion[id.value], () => { if (showEnglish.value) void loadTranslation(); });
+watch(id, () => { showEnglish.value = false; translations.value = null; });
+
+/** Copy the visible lines as "[time] Name: text" for pasting into another tool. */
+async function copyAsContext() {
+  if (!t.value) return;
+  const lines = shown.value.map((s) => `[${formatTime(s.start)}] ${s.speaker ? `${speakerName(s.speaker)}: ` : ""}${s.text}`);
+  const head = `# ${t.value.title}${t.value.recorded_at ? ` (${formatDate(t.value.recorded_at)})` : ""}\n\n`;
+  await navigator.clipboard.writeText(head + lines.join("\n"));
+  toast.success(`Copied ${lines.length} line(s)`);
+}
+
+const briefing = ref(false);
+async function exportBrief() {
+  if (!t.value || briefing.value) return;
+  briefing.value = true;
+  toast("Writing the project brief…", { description: "About half a minute." });
+  try {
+    const md = await api.aiBrief({ kind: "transcript", id: t.value.id });
+    const path = await save({ defaultPath: `${t.value.title} — brief.md`, filters: [{ name: "Markdown", extensions: ["md"] }] });
+    if (path) {
+      await api.saveText(path, md);
+      toast.success("Brief exported");
+    }
+  } catch (e) {
+    toast.error("Brief failed", { description: String(e) });
+  } finally {
+    briefing.value = false;
+  }
+}
+
+/** Right-hand assistant panel (summary + questions); ⌘J toggles it. */
+const aiPanel = useLocalStorage("transcriber.aiPanel", false);
+useEventListener(window, "keydown", (e: KeyboardEvent) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
+    e.preventDefault();
+    aiPanel.value = !aiPanel.value;
+  }
+});
+function openCitation(otherId: string, time: number) {
+  router.push({ name: "transcript", params: { id: otherId }, query: { t: String(time) } });
+}
+
 const retry = ref<JobOptions | null>(null);
 const fixing = ref(false);
 const checking = ref(false);
@@ -476,11 +554,21 @@ const saved = computed(() =>
           <DropdownMenuItem @click="doExport('srt')">Subtitles (.srt)</DropdownMenuItem>
           <DropdownMenuItem @click="doExport('vtt')">WebVTT (.vtt)</DropdownMenuItem>
           <DropdownMenuItem @click="doExport('json')">JSON (.json)</DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem :disabled="briefing" @click="exportBrief"><FileText /> Project brief (.md)…</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <Button
+        variant="outline"
+        :class="aiPanel && 'border-primary text-primary'"
+        title="Summary and questions about this meeting (⌘J)"
+        @click="aiPanel = !aiPanel"
+      ><Sparkles /> Assistant</Button>
       <DropdownMenu>
         <DropdownMenuTrigger as-child><Button variant="ghost" size="icon"><MoreHorizontal /></Button></DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem :disabled="!segments.length" @click="copyAsContext"><ClipboardCopy /> Copy as text for AI</DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued' || !t.segments.length || !!viewing" @click="openFix">
             <Wrench /> Fix problems…
           </DropdownMenuItem>
@@ -494,6 +582,8 @@ const saved = computed(() =>
       </DropdownMenu>
     </header>
 
+    <div class="flex min-h-0 flex-1 overflow-hidden">
+    <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
     <div class="flex items-center gap-3 border-b px-6 py-2">
       <TranscriptMeta :t="t" />
       <span class="text-muted-foreground ml-auto truncate text-xs" :title="t.source_name">{{ t.source_name }}</span>
@@ -588,6 +678,14 @@ const saved = computed(() =>
           title="Shrink long stretches without speech on the timeline"
           @click="collapseBreaks = !collapseBreaks"
         ><Shrink /> Collapse breaks</Button>
+        <Button
+          v-if="segments.length"
+          variant="ghost"
+          size="sm"
+          :class="showEnglish ? 'text-primary' : 'text-muted-foreground'"
+          title="Show an English translation under each line (made once by the AI assistant)"
+          @click="toggleEnglish"
+        ><Loader2 v-if="showEnglish && translating" class="animate-spin" /><Languages v-else /> English</Button>
         <span class="text-muted-foreground ml-auto text-xs">
           {{ t.provider }}
           <template v-if="saved !== null"> · {{ formatDuration(t.duration) }} → {{ formatDuration(t.processed_duration) }} sent ({{ saved }}% less)</template>
@@ -722,6 +820,7 @@ const saved = computed(() =>
         :names="names"
         :read-only="readOnly"
         :editing-id="editingId"
+        :translations="showEnglish ? translations : null"
         @seek="seek"
         @speaker-menu="openSpeakerMenu"
         @edit="(seg) => (editingId = seg.id)"
@@ -729,6 +828,20 @@ const saved = computed(() =>
         @cancel="editingId = null"
       />
     </template>
+
+    </div>
+    <aside v-if="aiPanel" class="bg-card w-[26rem] shrink-0 border-l">
+      <AiPanel
+        :t="t"
+        :names="names"
+        :read-only="readOnly"
+        @seek="(time) => seek(time, false)"
+        @open="openCitation"
+        @refresh="load"
+        @close="aiPanel = false"
+      />
+    </aside>
+    </div>
 
     <div
       v-if="speakerMenu"

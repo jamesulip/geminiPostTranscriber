@@ -16,6 +16,8 @@ const props = defineProps<{
   query: string;
   readOnly: boolean;
   editing: boolean;
+  /** English translation shown under the original (from the AI assistant). */
+  translation?: string;
 }>();
 const emit = defineEmits<{
   seek: [time: number];
@@ -73,13 +75,15 @@ onBeforeUnmount(() => {
       @keydown.enter.exact.prevent="emit('save', draft)"
       @keydown.esc="emit('cancel')"
     />
-    <p
-      v-else
-      class="text-sm leading-relaxed"
-      :class="readOnly ? 'cursor-auto' : 'cursor-text'"
-      :title="readOnly ? '' : 'Double-click to edit'"
-      @dblclick="!readOnly && emit('edit')"
-      v-html="highlightHtml(seg.text, query)"
-    />
+    <div v-else class="min-w-0">
+      <p
+        class="text-sm leading-relaxed"
+        :class="readOnly ? 'cursor-auto' : 'cursor-text'"
+        :title="readOnly ? '' : 'Double-click to edit'"
+        @dblclick="!readOnly && emit('edit')"
+        v-html="highlightHtml(seg.text, query)"
+      />
+      <p v-if="translation" class="text-muted-foreground mt-0.5 text-sm leading-relaxed">{{ translation }}</p>
+    </div>
   </div>
 </template>

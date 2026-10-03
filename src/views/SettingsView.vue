@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, watchEffect } from "vue";
-import { Eye, EyeOff, Plus, Trash2 } from "@lucide/vue";
+import { computed, onMounted, reactive, ref, watchEffect } from "vue";
+import { Eye, EyeOff, Loader2, Plus, Sparkles, Trash2 } from "@lucide/vue";
 import { toast } from "vue-sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,15 +8,47 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { api, diarizes, type SilenceMethod, type Settings } from "@/lib/api";
+import { api, defaultChatModel, diarizes, transcribes, PROVIDER_KIND_LABEL, type ProviderKind, type SilenceMethod, type Settings } from "@/lib/api";
+import { useAi } from "@/stores/ai";
 import { useSettings } from "@/stores/settings";
 
 const store = useSettings();
 const form = ref<Settings | null>(null);
 const reveal = ref<Record<string, boolean>>({});
-const BUILTIN = ["groq", "openai", "gemini"];
+const BUILTIN = ["groq", "openai", "gemini", "anthropic"];
+const ai = useAi();
+const testing = ref(false);
+const testResult = ref<string | null>(null);
+
+const aiProvider = computed(() => form.value?.providers.find((p) => p.id === form.value!.ai_provider));
+const chatPlaceholder = computed(() => (aiProvider.value ? defaultChatModel(aiProvider.value.kind) : ""));
+
+async function testAi() {
+  const f = form.value!;
+  testing.value = true;
+  testResult.value = null;
+  try {
+    // Test what's on screen: save first so the backend sees the key and model being tried.
+    await store.save(f);
+    testResult.value = await api.aiTestConnection(f.ai_provider, f.ai_model || chatPlaceholder.value);
+  } catch (e) {
+    testResult.value = `Failed: ${e}`;
+  } finally {
+    testing.value = false;
+  }
+}
+
+async function indexLibrary() {
+  try {
+    await store.save(form.value!);
+    await api.aiEmbedLibrary();
+    toast("Indexing the library for meaning search", { description: "Runs in the background; progress shows in the sidebar." });
+  } catch (e) {
+    toast.error("Couldn't start indexing", { description: String(e) });
+  }
+}
 // Built-in price estimate per provider, shown as the placeholder of the price field.
-const estimates = reactive<Record<string, { per_minute: number; tokens: [number, number] | null }>>({});
+const estimates = reactive<Record<string, { per_minute: number; tokens: [number, number] | null; text: { input: number; output: number; cached_input: number } | null }>>({});
 watchEffect(() => {
   for (const p of form.value?.providers ?? []) {
     const model = p.model;
@@ -25,7 +57,7 @@ watchEffect(() => {
 });
 
 type Provider = Settings["providers"][number];
-type PriceKey = "price_per_minute" | "price_input_per_mtok" | "price_output_per_mtok";
+type PriceKey = "price_per_minute" | "price_input_per_mtok" | "price_output_per_mtok" | "price_cached_input_per_mtok";
 
 /** Optional numeric field: empty input = null (use the built-in estimate). */
 function setPrice(p: Provider, key: PriceKey, v: string | number) {
@@ -37,17 +69,18 @@ onMounted(async () => {
   form.value = JSON.parse(JSON.stringify(await store.load()));
 });
 
-function addProvider() {
+function addProvider(kind: ProviderKind = "openai") {
   form.value!.providers.push({
-    id: `custom-${Date.now()}`,
-    name: "Custom (OpenAI-compatible)",
-    kind: "openai",
-    base_url: "http://localhost:8000/v1",
+    id: `${kind === "anthropic" ? "anthropic" : "custom"}-${Date.now()}`,
+    name: kind === "anthropic" ? "Anthropic" : "Custom (OpenAI-compatible)",
+    kind,
+    base_url: kind === "anthropic" ? "https://api.anthropic.com" : "http://localhost:8000/v1",
     api_key: "",
-    model: "whisper-1",
+    model: kind === "anthropic" ? "claude-opus-5-5" : "whisper-1",
     price_per_minute: null,
     price_input_per_mtok: null,
     price_output_per_mtok: null,
+    price_cached_input_per_mtok: null,
   });
 }
 
@@ -56,6 +89,8 @@ function removeProvider(id: string) {
   f.providers = f.providers.filter((p) => p.id !== id);
   if (f.default_provider === id) f.default_provider = f.providers[0]?.id ?? "";
   if (f.diarize_provider === id) f.diarize_provider = f.providers.find((p) => diarizes(p))?.id ?? f.default_provider;
+  if (f.ai_provider === id) f.ai_provider = f.providers[0]?.id ?? "";
+  if (f.ai_embedding_provider === id) f.ai_embedding_provider = f.providers.find((p) => p.kind !== "anthropic")?.id ?? "";
 }
 
 async function save() {
@@ -88,7 +123,7 @@ async function save() {
             <div v-for="p in form.providers" :key="p.id" class="grid gap-3 rounded-lg border p-4">
               <div class="flex items-center gap-2">
                 <Input v-model="p.name" class="h-8 max-w-56 font-medium" />
-                <span class="text-muted-foreground text-xs">{{ p.kind === "gemini" ? "Gemini API" : "OpenAI-compatible" }}</span>
+                <span class="text-muted-foreground text-xs">{{ PROVIDER_KIND_LABEL[p.kind] }}<template v-if="p.kind === 'anthropic'"> · assistant only (no audio)</template></span>
                 <Button v-if="!BUILTIN.includes(p.id)" variant="ghost" size="icon" class="ml-auto" @click="removeProvider(p.id)">
                   <Trash2 />
                 </Button>
@@ -104,8 +139,8 @@ async function save() {
                   </div>
                 </div>
                 <div class="grid gap-1.5"><Label>Base URL</Label><Input v-model="p.base_url" /></div>
-                <div class="grid gap-1.5"><Label>Default model</Label><Input v-model="p.model" /></div>
-                <div class="grid gap-1.5">
+                <div class="grid gap-1.5"><Label>{{ p.kind === "anthropic" ? "Default chat model" : "Default transcription model" }}</Label><Input v-model="p.model" /></div>
+                <div v-if="transcribes(p)" class="grid gap-1.5">
                   <Label>Price per audio minute (USD)</Label>
                   <Input
                     :model-value="p.price_per_minute ?? ''"
@@ -136,11 +171,105 @@ async function save() {
                       @update:model-value="(v) => setPrice(p, 'price_output_per_mtok', v)"
                     />
                   </div>
-                  <p class="text-muted-foreground text-xs">Used instead of the per-minute price when the provider reports tokens.</p>
+                  <p class="text-muted-foreground text-xs">Used instead of the per-minute price when the provider reports tokens; also the assistant's text rates for this provider's chat model.</p>
+                </div>
+                <div class="grid gap-1.5">
+                  <Label>Cached prompt tokens per 1M (USD)</Label>
+                  <Input
+                    :model-value="p.price_cached_input_per_mtok ?? ''"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    :placeholder="estimates[p.id]?.text ? `${estimates[p.id].text!.cached_input} (built-in)` : '25% of input'"
+                    @update:model-value="(v) => setPrice(p, 'price_cached_input_per_mtok', v)"
+                  />
+                  <p class="text-muted-foreground text-xs">Assistant only: what the provider charges for prompt tokens served from its cache.</p>
                 </div>
               </div>
             </div>
-            <Button variant="outline" class="w-fit" @click="addProvider"><Plus /> Add OpenAI-compatible provider</Button>
+            <div class="flex flex-wrap gap-2">
+              <Button variant="outline" class="w-fit" @click="addProvider()"><Plus /> Add OpenAI-compatible provider</Button>
+              <Button variant="outline" class="w-fit" @click="addProvider('anthropic')"><Plus /> Add Anthropic provider</Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle class="flex items-center gap-2"><Sparkles class="text-primary size-4" /> AI assistant</CardTitle>
+            <CardDescription>
+              Summaries, questions with citations, and meaning search over your transcripts. Each transcript is summarised once
+              and indexed; questions then send only the relevant parts, so a long meeting isn't re-read every time.
+            </CardDescription>
+          </CardHeader>
+          <CardContent class="grid grid-cols-2 gap-4">
+            <div class="grid gap-1.5">
+              <Label>Provider for questions and summaries</Label>
+              <Select v-model="form.ai_provider">
+                <SelectTrigger class="w-full"><SelectValue placeholder="Pick a provider" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="p in form.providers" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Chat model</Label>
+              <Input v-model="form.ai_model" :placeholder="chatPlaceholder" />
+              <p class="text-muted-foreground text-xs">Gemini: gemini-3.8-flash is cheap and has context caching. Anthropic: claude-opus-5-5 (claude-sonnet-5-5 is cheaper). Groq/OpenAI: any chat model.</p>
+            </div>
+            <div class="col-span-2 flex items-center gap-3">
+              <Button variant="outline" size="sm" :disabled="testing || !form.ai_provider" @click="testAi">
+                <Loader2 v-if="testing" class="animate-spin" /> Test connection
+              </Button>
+              <span v-if="testResult" class="text-xs" :class="testResult.startsWith('Failed') ? 'text-destructive' : 'text-muted-foreground'">{{ testResult }}</span>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Provider for meaning search (embeddings)</Label>
+              <Select v-model="form.ai_embedding_provider">
+                <SelectTrigger class="w-full"><SelectValue placeholder="Pick a provider" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem v-for="p in form.providers.filter((x) => x.kind !== 'anthropic')" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p class="text-muted-foreground text-xs">Anthropic has no embeddings; Gemini or OpenAI work. Must handle Filipino and English.</p>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Embedding model</Label>
+              <Input v-model="form.ai_embedding_model" placeholder="gemini-embedding-001" />
+              <p class="text-muted-foreground text-xs">Changing it re-indexes everything on next use. OpenAI: text-embedding-3-small.</p>
+            </div>
+            <div class="col-span-2 flex items-start justify-between gap-4 rounded-lg border p-3">
+              <div class="grid gap-0.5">
+                <Label for="ai-auto">Summarise each transcript when it finishes</Label>
+                <p class="text-muted-foreground text-xs">
+                  Names the meeting, builds decisions/action items/topics/glossary and indexes it for search. Costs cents per meeting
+                  and is only redone when the transcript changes.
+                </p>
+              </div>
+              <Switch id="ai-auto" v-model="form.ai_auto_digest" />
+            </div>
+            <div class="col-span-2 flex items-start justify-between gap-4 rounded-lg border p-3">
+              <div class="grid gap-0.5">
+                <Label for="ai-cache">Keep the whole transcript cached at the provider while asking</Label>
+                <p class="text-muted-foreground text-xs">
+                  Gemini only (Anthropic caches automatically). With “Read all” on, the transcript is uploaded once and later
+                  questions pay the cached-input rate; Google charges a small storage fee per hour it stays cached.
+                </p>
+                <div class="mt-2 flex items-center gap-2">
+                  <Label class="text-xs">Keep for (minutes)</Label>
+                  <Input v-model.number="form.ai_context_cache_ttl_minutes" type="number" min="5" max="1440" class="h-7 w-24" />
+                </div>
+              </div>
+              <Switch id="ai-cache" v-model="form.ai_context_cache" />
+            </div>
+            <div class="col-span-2 flex items-center gap-3">
+              <Button variant="outline" size="sm" :disabled="ai.isRunning('embed:library')" @click="indexLibrary">
+                <Loader2 v-if="ai.isRunning('embed:library')" class="animate-spin" /> Index library for meaning search
+              </Button>
+              <span class="text-muted-foreground text-xs">
+                {{ ai.running["embed:library"]?.message ?? "Embeds transcripts that aren't indexed yet (summaries do this automatically)." }}
+              </span>
+            </div>
           </CardContent>
         </Card>
 
@@ -155,7 +284,7 @@ async function save() {
               <Select v-model="form.default_provider">
                 <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem v-for="p in form.providers" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
+                  <SelectItem v-for="p in form.providers.filter((x) => transcribes(x))" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>
                 </SelectContent>
               </Select>
               <p class="text-muted-foreground text-xs">Default. Pick the cheapest — Groq turbo is ~$0.04 per hour sent.</p>

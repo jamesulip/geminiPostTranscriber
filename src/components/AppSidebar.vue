@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import {
-  AudioLines, ChartColumn, ChevronRight, Moon, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
+  AudioLines, ChartColumn, ChevronRight, Moon, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Sparkles, Tag as TagIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -92,6 +92,15 @@ async function upload() {
       <Button variant="outline" class="text-muted-foreground w-full justify-start" @click="ui.searchOpen = true">
         <Search /> Search
         <kbd class="bg-muted ml-auto rounded px-1.5 text-[10px]">⌘K</kbd>
+      </Button>
+      <Button
+        variant="outline"
+        class="text-muted-foreground w-full justify-start"
+        :class="route.name === 'ask' && 'bg-sidebar-accent'"
+        title="Ask questions across your meetings"
+        @click="router.push({ name: 'ask' })"
+      >
+        <Sparkles /> Ask
       </Button>
     </div>
 
