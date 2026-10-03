@@ -399,6 +399,111 @@ pub async fn encode_chunk(condensed: &Path, start: f64, duration: f64, out: &Pat
 }
 
 /// Cut `[start, start + duration)` of any audio file into a 16 kHz mono WAV.
+/// The playback copy used when the webview can't play the original (macOS rejects long AAC
+/// files with high sample rates: too many frames to index). Constant-bitrate MP3 needs no index
+/// and seeks precisely.
+pub fn playback_path(original: &Path) -> PathBuf {
+    original.with_extension("play.mp3")
+}
+
+/// Make the playback copy (once). Returns its path.
+pub async fn ensure_playback_copy(original: &Path) -> Result<PathBuf> {
+    let out = playback_path(original);
+    if out.exists() {
+        return Ok(out);
+    }
+    let tmp = out.with_extension("part.mp3");
+    let (src, dst) = (original.to_string_lossy().to_string(), tmp.to_string_lossy().to_string());
+    ffmpeg(&["-y", "-i", &src, "-vn", "-ac", "1", "-ar", "24000", "-c:a", "libmp3lame", "-b:a", "48k", &dst]).await?;
+    std::fs::rename(&tmp, &out)?;
+    Ok(out)
+}
+
+/// Loudness over time for a waveform/level display: one value per `LEVEL_STEP` seconds,
+/// 0..255 mapped from -60 dBFS..0 dBFS (RMS). Streams ffmpeg's PCM output, so long recordings
+/// don't need a temp file.
+pub const LEVEL_STEP: f64 = 0.1;
+
+pub async fn loudness(input: &Path) -> Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    const RATE: usize = 4000;
+    let window = (RATE as f64 * LEVEL_STEP) as usize;
+    let src = input.to_string_lossy().to_string();
+    let mut child = Command::new(ffmpeg_path())
+        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i", &src, "-vn", "-ac", "1", "-ar", "4000", "-f", "s16le", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to run ffmpeg")?;
+    let mut out = child.stdout.take().unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut carry: Option<u8> = None;
+    let (mut acc, mut n) = (0f64, 0usize);
+    let mut levels = Vec::new();
+    let push = |acc: f64, n: usize, levels: &mut Vec<u8>| {
+        let rms = (acc / n.max(1) as f64).sqrt() / 32768.0;
+        let db = 20.0 * rms.max(1e-9).log10();
+        levels.push(((db + 60.0) / 60.0 * 255.0).clamp(0.0, 255.0) as u8);
+    };
+    loop {
+        let r = out.read(&mut buf).await?;
+        if r == 0 {
+            break;
+        }
+        let mut bytes = &buf[..r];
+        if let Some(lo) = carry.take() {
+            let v = i16::from_le_bytes([lo, bytes[0]]) as f64;
+            acc += v * v;
+            n += 1;
+            bytes = &bytes[1..];
+        }
+        for b in bytes.chunks_exact(2) {
+            let v = i16::from_le_bytes([b[0], b[1]]) as f64;
+            acc += v * v;
+            n += 1;
+            if n == window {
+                push(acc, n, &mut levels);
+                acc = 0.0;
+                n = 0;
+            }
+        }
+        if bytes.len() % 2 == 1 {
+            carry = Some(bytes[bytes.len() - 1]);
+        }
+    }
+    if n > 0 {
+        push(acc, n, &mut levels);
+    }
+    let status = child.wait().await?;
+    if !status.success() && levels.is_empty() {
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err).await;
+        }
+        bail!("ffmpeg failed: {}", err.trim());
+    }
+    Ok(levels)
+}
+
+/// Cached loudness for `original` (computed once, stored next to it).
+pub async fn ensure_levels(original: &Path) -> Result<Vec<u8>> {
+    let cache = original.with_extension("levels.bin");
+    if let Ok(data) = std::fs::read(&cache) {
+        if !data.is_empty() {
+            return Ok(data);
+        }
+    }
+    let levels = loudness(original).await?;
+    let tmp = cache.with_extension("part");
+    if std::fs::write(&tmp, &levels).is_ok() {
+        let _ = std::fs::rename(&tmp, &cache);
+    }
+    Ok(levels)
+}
+
 pub async fn extract_range(input: &Path, start: f64, duration: f64, out: &Path) -> Result<()> {
     let (ss, t) = (format!("{start:.3}"), format!("{duration:.3}"));
     let (src, dst) = (input.to_string_lossy().to_string(), out.to_string_lossy().to_string());
@@ -633,6 +738,23 @@ mod tests {
             assert!((o - a).abs() < 0.06, "mapped {o} expected {a}");
         }
         assert_eq!(p.chunks.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Loudness buckets follow the signal: silence at the floor, the tone well above it.
+    #[tokio::test]
+    async fn loudness_follows_signal() {
+        let dir = std::env::temp_dir().join(format!("transcriber-levels-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.wav");
+        let expr = "aevalsrc='if(between(t,2,4),0.5*sin(2*PI*440*t),0)':s=16000:d=6";
+        ffmpeg(&["-y", "-f", "lavfi", "-i", expr, src.to_str().unwrap()]).await.unwrap();
+        let lv = ensure_levels(&src).await.unwrap();
+        let per_s = (1.0 / LEVEL_STEP) as usize;
+        assert!((lv.len() as i64 - 6 * per_s as i64).abs() <= 1, "len {}", lv.len());
+        assert!(lv[per_s] < 10, "silence {}", lv[per_s]);
+        assert!(lv[3 * per_s] > 200, "tone {}", lv[3 * per_s]); // 0.5 amplitude sine ≈ -9 dBFS
+        assert!(src.with_extension("levels.bin").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

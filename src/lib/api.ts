@@ -241,6 +241,12 @@ export interface BatchView {
   outcome: string | null;
 }
 
+/** Loudness over time: one value (0..255, -60..0 dBFS) per `step` seconds. */
+export interface AudioLevels {
+  step: number;
+  levels: number[];
+}
+
 export type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 
 export const api = {
@@ -252,6 +258,9 @@ export const api = {
     invoke<string>("start_transcription", { path, options }),
   retranscribe: (id: string, options: JobOptions) => invoke<void>("retranscribe", { id, options }),
   findProblems: (id: string) => invoke<ProblemRange[]>("find_problems", { id }),
+  /** MP3 copy of the audio (made on first use) for recordings the player can't open directly. */
+  playbackAudio: (id: string) => invoke<string>("playback_audio", { id }),
+  audioLevels: (id: string) => invoke<AudioLevels>("audio_levels", { id }),
   speechInGaps: (id: string, gaps: [number, number][]) => invoke<number[]>("speech_in_gaps", { id, gaps }),
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),

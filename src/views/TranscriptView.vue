@@ -6,8 +6,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
-  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, Play,
-  Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, Wrench,
+  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, GitCompare, History, Loader2, LocateFixed, MoreHorizontal, Pause,
+  Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, Users, Wrench,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,13 +20,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import FolderSelect from "@/components/FolderSelect.vue";
 import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
+import LevelMeter from "@/components/LevelMeter.vue";
+import SpeakerIdDialog from "@/components/SpeakerIdDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
+import CompareDialog from "@/components/CompareDialog.vue";
 import OptionsForm from "@/components/OptionsForm.vue";
 import PromptDialog from "@/components/PromptDialog.vue";
 import {
-  api, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail, type VersionDetail, type VersionInfo,
+  api, type AudioLevels, type ExportFormat, type JobOptions, type SegmentRow, type TranscriptDetail, type VersionDetail,
+  type VersionInfo,
 } from "@/lib/api";
 import { formatDate, formatDuration, formatLanguage, formatTime, formatUsd, speakerColor } from "@/lib/format";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
@@ -74,6 +78,12 @@ function openSpeakerMenu(seg: SegmentRow, anchor: HTMLElement) {
   speakerMenu.value = { seg, x: r.left, y: Math.min(r.bottom + 4, window.innerHeight - 260) };
 }
 const renaming = ref<string | null>(null);
+const identifying = ref(false);
+
+function openIdentify() {
+  audio.value?.pause();
+  identifying.value = true;
+}
 const retry = ref<JobOptions | null>(null);
 const fixing = ref(false);
 const checking = ref(false);
@@ -91,6 +101,17 @@ async function checkNow() {
 async function openFix() {
   await settingsStore.load();
   fixing.value = true;
+}
+
+/** Versions in the compare dialog: an archived version id, or "current". */
+const comparing = ref<{ from: string; to: string } | null>(null);
+const canCompare = computed(() => versions.value.length + (t.value?.segments.length ? 1 : 0) >= 2);
+
+/** Compare an archived version (default: the newest) with the current one. */
+function openCompare(versionId = versions.value[0]?.id) {
+  if (versionId === undefined) return;
+  const other = t.value?.segments.length ? "current" : String(versions.value.find((v) => v.id !== versionId)?.id);
+  comparing.value = { from: String(versionId), to: other };
 }
 
 const job = computed(() => jobs.progress[id.value]);
@@ -130,8 +151,51 @@ watch(job, (now, before) => {
   if (before && !now) void load();
 });
 
-const src = computed(() => (t.value ? convertFileSrc(t.value.audio_path) : ""));
+/**
+ * macOS can't open long AAC recordings with high sample rates (too many frames to index), so on
+ * a load error the app switches to an MP3 playback copy, made once and kept next to the original.
+ */
+const playbackPath = ref<string | null>(null);
+const preparingAudio = ref(false);
+const audioError = ref<string | null>(null);
+watch(id, () => {
+  playbackPath.value = null;
+  audioError.value = null;
+});
+const src = computed(() => (t.value ? convertFileSrc(playbackPath.value ?? t.value.audio_path) : ""));
+async function onAudioError() {
+  if (!t.value || playbackPath.value || preparingAudio.value) {
+    if (playbackPath.value) audioError.value = "This recording can't be played.";
+    return;
+  }
+  const tid = t.value.id;
+  preparingAudio.value = true;
+  try {
+    const path = await api.playbackAudio(tid);
+    if (tid === id.value) playbackPath.value = path;
+  } catch (e) {
+    audioError.value = `Couldn't prepare the audio for playback: ${e}`;
+  } finally {
+    preparingAudio.value = false;
+  }
+}
 const duration = computed(() => t.value?.duration || audioDuration.value);
+
+/** Loudness over time for the timeline's level lane and the meter (computed once per recording). */
+const levels = ref<AudioLevels | null>(null);
+watch(
+  id,
+  async (tid) => {
+    levels.value = null;
+    try {
+      const lv = await api.audioLevels(tid);
+      if (tid === id.value) levels.value = lv;
+    } catch (e) {
+      console.warn("audio levels failed", e);
+    }
+  },
+  { immediate: true },
+);
 
 /** Segments/speakers of the version on screen. */
 /** While a job runs or after it failed (with nothing saved yet), show the chunks finished so far. */
@@ -159,7 +223,7 @@ watch(
     if (!tid || !gaps.length) return;
     try {
       const speech = await api.speechInGaps(tid, gaps.map((g) => [g.start, g.end]));
-      if (tid !== id.value || segs !== segments.value) return; // stale
+      if (tid !== id.value || segs !== segments.value || !Array.isArray(speech)) return; // stale
       missingGaps.value = new Set(gaps.filter((g, i) => isMissing(g, speech[i])).map(gapKey));
     } catch (e) {
       console.warn("speech check failed", e);
@@ -215,13 +279,13 @@ function seek(time: number, play = true) {
   if (!a) return;
   a.currentTime = time;
   currentTime.value = time;
-  if (play) void a.play();
+  if (play) void a.play().catch(() => {});
 }
 
 function togglePlay() {
   const a = audio.value;
   if (!a) return;
-  a.paused ? void a.play() : a.pause();
+  a.paused ? void a.play().catch(() => {}) : a.pause();
 }
 watch(rate, (r) => audio.value && (audio.value.playbackRate = Number(r)));
 
@@ -391,6 +455,10 @@ const saved = computed(() =>
           <p v-if="!versions.length" class="text-muted-foreground px-2 py-1.5 text-xs">
             Re-transcribing keeps earlier versions here.
           </p>
+          <template v-else>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem :disabled="!canCompare" @click="openCompare(viewing?.id)"><GitCompare /> Compare versions…</DropdownMenuItem>
+          </template>
         </DropdownMenuContent>
       </DropdownMenu>
       <DropdownMenu>
@@ -411,6 +479,7 @@ const saved = computed(() =>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued' || !t.segments.length || !!viewing" @click="openFix">
             <Wrench /> Fix problems…
           </DropdownMenuItem>
+          <DropdownMenuItem :disabled="!speakerOrder.length || readOnly" @click="openIdentify"><Users /> Identify speakers…</DropdownMenuItem>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
           <DropdownMenuItem v-if="t.status === 'processing' || t.status === 'queued'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
@@ -434,6 +503,9 @@ const saved = computed(() =>
         {{ formatDate(viewing.transcribed_at) }} — read-only
       </span>
       <div class="ml-auto flex shrink-0 gap-1.5">
+        <Button v-if="t.segments.length" size="sm" variant="outline" @click="openCompare(viewing.id)">
+          <GitCompare /> Compare with current
+        </Button>
         <Button size="sm" @click="restoreViewed"><RotateCcw /> Restore this version</Button>
         <Button size="sm" variant="ghost" @click="deleteViewed"><Trash2 /> Delete</Button>
         <Button size="sm" variant="outline" @click="viewVersion(null)">Back to current</Button>
@@ -467,6 +539,7 @@ const saved = computed(() =>
         ref="audio"
         :src="src"
         preload="metadata"
+        @error="onAudioError"
         @timeupdate="currentTime = ($event.target as HTMLAudioElement).currentTime"
         @loadedmetadata="audioDuration = ($event.target as HTMLAudioElement).duration"
         @play="playing = true"
@@ -477,6 +550,11 @@ const saved = computed(() =>
           <Pause v-if="playing" /><Play v-else />
         </Button>
         <span class="text-sm tabular-nums">{{ formatTime(currentTime) }} / {{ formatTime(duration) }}</span>
+        <LevelMeter :levels="levels" :audio="audio" :current-time="currentTime" :playing="playing" />
+        <span v-if="preparingAudio" class="text-muted-foreground flex items-center gap-1 text-xs">
+          <Loader2 class="size-3 animate-spin" /> Preparing audio for playback (one time, about a minute)…
+        </span>
+        <span v-else-if="audioError" class="text-destructive text-xs">{{ audioError }}</span>
         <Select v-model="rate">
           <SelectTrigger size="sm" class="w-20"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -516,6 +594,8 @@ const saved = computed(() =>
         :missing="missingGaps"
         :duration="shownDuration"
         :current-time="currentTime"
+        :playing="playing"
+        :levels="levels"
         :speaker-order="speakerOrder"
         :names="names"
         :matches="matches"
@@ -599,6 +679,13 @@ const saved = computed(() =>
             <span class="size-2 rounded-full" :style="{ backgroundColor: speakerColor(l, speakerOrder) }" />
             {{ speakerName(l) }}
           </button>
+          <Button
+            v-if="speakerOrder.length && !readOnly"
+            variant="outline"
+            size="sm"
+            title="Listen to a clip of each speaker and name them"
+            @click="openIdentify"
+          ><Users /> Identify speakers…</Button>
         </div>
       </div>
 
@@ -656,6 +743,29 @@ const saved = computed(() =>
       @close="fixing = false"
       @seek="(time) => seek(time, false)"
       @started="(fixing = false), load(), library.refresh()"
+    />
+
+    <CompareDialog
+      v-if="comparing"
+      :t="t"
+      :versions="versions"
+      :from="comparing.from"
+      :to="comparing.to"
+      :playing="playing"
+      @close="comparing = null"
+      @seek="seek"
+      @pause="audio?.pause()"
+    />
+
+    <SpeakerIdDialog
+      v-if="identifying"
+      :transcript-id="t.id"
+      :segments="segments"
+      :speaker-order="speakerOrder"
+      :names="names"
+      :src="src"
+      @close="identifying = false"
+      @saved="(identifying = false), load()"
     />
 
     <PromptDialog

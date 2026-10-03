@@ -189,6 +189,37 @@ async fn speech_in_gaps(state: State<'_, AppState>, id: String, gaps: Vec<(f64, 
     Ok(out)
 }
 
+/// Path of an MP3 copy of the transcript's audio, made on first use, for recordings the webview
+/// can't play directly.
+#[tauri::command]
+async fn playback_audio(state: State<'_, AppState>, id: String) -> CmdResult<String> {
+    let original = {
+        let db = state.db.lock().unwrap();
+        PathBuf::from(db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?.audio_path)
+    };
+    let p = audio::ensure_playback_copy(&original).await.map_err(err)?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct AudioLevels {
+    /// Seconds per value.
+    pub step: f64,
+    /// 0..255, from -60 dBFS to 0 dBFS.
+    pub levels: Vec<u8>,
+}
+
+/// Loudness over time of the transcript's audio (for the waveform lane and the level meter).
+#[tauri::command]
+async fn audio_levels(state: State<'_, AppState>, id: String) -> CmdResult<AudioLevels> {
+    let original = {
+        let db = state.db.lock().unwrap();
+        PathBuf::from(db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?.audio_path)
+    };
+    let levels = audio::ensure_levels(&original).await.map_err(err)?;
+    Ok(AudioLevels { step: audio::LEVEL_STEP, levels })
+}
+
 /// Stretches of the current version that look wrong (missing text, loops, impossible timings,
 /// missing speaker labels), for re-transcribing only those parts.
 #[tauri::command]
@@ -321,6 +352,8 @@ fn delete_transcript(app: AppHandle, state: State<AppState>, id: String) -> CmdR
     let audio = db::delete_transcript(&state.db.lock().unwrap(), &id).map_err(err)?;
     let _ = std::fs::remove_dir_all(state.cache_dir.join("results").join(&id));
     if let Some(p) = audio {
+        let _ = std::fs::remove_file(audio::playback_path(std::path::Path::new(&p)));
+        let _ = std::fs::remove_file(std::path::Path::new(&p).with_extension("levels.bin"));
         let _ = std::fs::remove_file(p);
     }
     Ok(())
@@ -474,6 +507,8 @@ pub fn run() {
             retranscribe,
             find_problems,
             speech_in_gaps,
+            playback_audio,
+            audio_levels,
             repair_transcript,
             cancel_job,
             job_progress,

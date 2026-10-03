@@ -92,17 +92,21 @@ export class TimelineScale {
     return this.ranges.at(-1)!.end;
   }
 
-  /** Nice tick times that fall outside collapsed gaps and don't crowd each other. */
-  ticks(): number[] {
-    const steps = [10, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
-    const step = steps.find((s) => this.total / s <= 10) ?? 7200;
+  /**
+   * Nice tick times that fall outside collapsed gaps and don't crowd each other.
+   * `zoom` is how many track widths the timeline spans (more ticks when zoomed in).
+   */
+  ticks(zoom = 1): number[] {
+    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
+    const step = steps.find((s) => this.total / s <= 10 * zoom) ?? 7200;
     const out: number[] = [];
     let last = -1;
+    const minGap = 0.06 / zoom;
     for (const r of this.ranges) {
       if (r.collapsed) continue;
       for (let t = Math.ceil(r.start / step) * step; t <= r.end; t += step) {
         const p = this.pos(t);
-        if (last < 0 || p - last > 0.06) {
+        if (last < 0 || p - last > minGap) {
           out.push(t);
           last = p;
         }
