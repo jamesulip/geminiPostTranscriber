@@ -8,6 +8,8 @@ pub enum ProviderKind {
     /// Any OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, ...).
     Openai,
     Gemini,
+    /// Anthropic Messages API. Text only: used by the AI assistant, can't transcribe audio.
+    Anthropic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +29,33 @@ pub struct ProviderConfig {
     pub price_input_per_mtok: Option<f64>,
     #[serde(default)]
     pub price_output_per_mtok: Option<f64>,
+    /// USD per 1M prompt tokens served from the provider's cache (AI assistant). `None` → built-in.
+    #[serde(default)]
+    pub price_cached_input_per_mtok: Option<f64>,
+}
+
+/// Text prices (USD per 1M tokens) for chat/summary requests.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TextPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cached_input: f64,
+}
+
+/// Published text rates for models the AI assistant may use.
+/// Gemini text input is billed at or below its audio rate; until a text rate is set in Settings,
+/// the audio rate from `known_token_price` is used as a conservative estimate (cached ≈ 25%).
+pub fn known_text_price(model: &str) -> Option<TextPrice> {
+    let m = model.to_lowercase();
+    let anthropic: &[(&str, TextPrice)] = &[
+        ("claude-opus-5-5", TextPrice { input: 4.0, output: 20.0, cached_input: 0.20 }),
+        ("claude-sonnet-5-5", TextPrice { input: 2.0, output: 10.0, cached_input: 0.20 }),
+        ("claude-haiku-4-5", TextPrice { input: 1.0, output: 5.0, cached_input: 0.10 }),
+    ];
+    if let Some((_, p)) = anthropic.iter().find(|(k, _)| m.contains(k)) {
+        return Some(*p);
+    }
+    known_token_price(model).map(|(i, o)| TextPrice { input: i, output: o, cached_input: i * 0.25 })
 }
 
 /// Published token prices (USD per 1M input, 1M output) for models billed by tokens.
@@ -76,9 +105,24 @@ impl ProviderConfig {
         }
     }
 
+    /// Text prices for the AI assistant, honouring the user's overrides.
+    pub fn text_price(&self) -> Option<TextPrice> {
+        let valid = |p: Option<f64>| p.filter(|v| v.is_finite() && *v >= 0.0);
+        let known = known_text_price(&self.model);
+        let input = valid(self.price_input_per_mtok).or(known.map(|k| k.input))?;
+        let output = valid(self.price_output_per_mtok).or(known.map(|k| k.output))?;
+        let cached_input = valid(self.price_cached_input_per_mtok).or(known.map(|k| k.cached_input)).unwrap_or(input * 0.25);
+        Some(TextPrice { input, output, cached_input })
+    }
+
     /// Whether this provider/model returns speaker labels.
     pub fn diarizes(&self) -> bool {
         self.kind == ProviderKind::Gemini || self.model.contains("diarize")
+    }
+
+    /// Whether this provider can transcribe audio (Anthropic is text-only).
+    pub fn transcribes(&self) -> bool {
+        self.kind != ProviderKind::Anthropic
     }
 }
 
@@ -124,6 +168,20 @@ pub struct Settings {
     /// Re-do batch parts that Google blocked or returned empty, right away with Gemini 3.5 Flash
     /// (3.5 Transcribe if that's blocked too).
     pub batch_retry_failed: bool,
+
+    // AI assistant ---------------------------------------------------------------------------
+    /// Provider id used for questions and summaries.
+    pub ai_provider: String,
+    /// Chat model on that provider (its transcription model is separate).
+    pub ai_model: String,
+    /// Provider id used for embeddings (semantic search). Anthropic has no embeddings.
+    pub ai_embedding_provider: String,
+    pub ai_embedding_model: String,
+    /// Summarise each transcript as soon as it finishes (also names it and builds the glossary).
+    pub ai_auto_digest: bool,
+    /// Keep a whole transcript in the provider's prompt cache while asking several questions.
+    pub ai_context_cache: bool,
+    pub ai_context_cache_ttl_minutes: u32,
 }
 
 impl Default for Settings {
@@ -140,6 +198,7 @@ impl Default for Settings {
                     price_per_minute: None,
                     price_input_per_mtok: None,
                     price_output_per_mtok: None,
+                    price_cached_input_per_mtok: None,
                 },
                 ProviderConfig {
                     id: "openai".into(),
@@ -151,6 +210,7 @@ impl Default for Settings {
                     price_per_minute: None,
                     price_input_per_mtok: None,
                     price_output_per_mtok: None,
+                    price_cached_input_per_mtok: None,
                 },
                 ProviderConfig {
                     id: "gemini".into(),
@@ -162,6 +222,7 @@ impl Default for Settings {
                     price_per_minute: None,
                     price_input_per_mtok: None,
                     price_output_per_mtok: None,
+                    price_cached_input_per_mtok: None,
                 },
             ],
             settings_version: CURRENT_VERSION,
@@ -180,11 +241,42 @@ impl Default for Settings {
             batch_model: "gemini-3.8-flash".into(),
             batch_chunk_minutes: 10.0,
             batch_retry_failed: true,
+            ai_provider: "gemini".into(),
+            ai_model: "gemini-3.8-flash".into(),
+            ai_embedding_provider: "gemini".into(),
+            ai_embedding_model: "gemini-embedding-001".into(),
+            ai_auto_digest: true,
+            ai_context_cache: false,
+            ai_context_cache_ttl_minutes: 60,
         }
     }
 }
 
-const CURRENT_VERSION: u32 = 3;
+/// Default chat model for a provider kind (used when a provider is picked for the assistant).
+pub fn default_chat_model(kind: &ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Gemini => "gemini-3.8-flash",
+        ProviderKind::Anthropic => "claude-opus-5-5",
+        ProviderKind::Openai => "gpt-4o-mini",
+    }
+}
+
+pub fn anthropic_provider() -> ProviderConfig {
+    ProviderConfig {
+        id: "anthropic".into(),
+        name: "Anthropic".into(),
+        kind: ProviderKind::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        api_key: String::new(),
+        model: "claude-opus-5-5".into(),
+        price_per_minute: None,
+        price_input_per_mtok: None,
+        price_output_per_mtok: None,
+        price_cached_input_per_mtok: None,
+    }
+}
+
+const CURRENT_VERSION: u32 = 4;
 
 pub fn load(path: &Path) -> Settings {
     let s: Settings = std::fs::read_to_string(path)
@@ -212,6 +304,16 @@ fn migrate(mut s: Settings) -> Settings {
             s.gemini_chunk_minutes = 10.0;
         }
         s.settings_version = 3;
+    }
+    if s.settings_version < 4 {
+        // v4: AI assistant; an Anthropic entry so a key can be pasted without creating a provider.
+        s.settings_version = 4;
+    }
+    if !s.providers.iter().any(|p| p.kind == ProviderKind::Anthropic) {
+        s.providers.push(anthropic_provider());
+    }
+    if !s.providers.iter().any(|p| p.id == s.ai_provider) {
+        s.ai_provider = s.providers.iter().find(|p| p.kind == ProviderKind::Gemini).map(|p| p.id.clone()).unwrap_or_default();
     }
     if !s.providers.iter().any(|p| p.id == s.diarize_provider) {
         if let Some(p) = s.providers.iter().find(|p| p.diarizes()) {
@@ -250,7 +352,9 @@ mod tests {
             "remove_silence": true, "silence_threshold_db": -35, "silence_min_duration": 0.7,
             "chunk_minutes": 10, "gemini_chunk_minutes": 25}"#;
         let s = migrate(serde_json::from_str(v1).unwrap());
-        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 3));
+        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 4));
+        assert!(s.providers.iter().any(|p| p.kind == ProviderKind::Anthropic));
+        assert_eq!(s.ai_provider, "");
         assert_eq!(s.gemini_chunk_minutes, 10.0);
         assert_eq!(s.silence_method, SilenceMethod::Speech);
         // A user's own choices are kept.

@@ -1,13 +1,14 @@
+pub mod ai;
 mod audio;
 mod batch;
-mod db;
+pub mod db;
 mod diarize;
 mod export;
 mod jobs;
-mod providers;
+pub mod providers;
 mod quality;
 mod repair;
-mod settings;
+pub mod settings;
 
 use rusqlite::Connection;
 use settings::Settings;
@@ -25,6 +26,8 @@ pub struct AppState {
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Latest progress of running jobs (for windows that reload mid-job).
     pub progress: Mutex<HashMap<String, jobs::Progress>>,
+    /// Cancel flags of running AI work, by key (`digest:<id>`, `ask:<thread>`, `embed:library`).
+    pub ai_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -467,12 +470,212 @@ struct KnownPrice {
     per_minute: f64,
     /// USD per 1M input/output tokens, for token-billed models.
     tokens: Option<(f64, f64)>,
+    /// Text rates for the AI assistant.
+    text: Option<settings::TextPrice>,
 }
 
 /// Built-in price estimates for a model, shown as Settings placeholders.
 #[tauri::command]
 fn known_price(model: String) -> KnownPrice {
-    KnownPrice { per_minute: settings::known_price(&model), tokens: settings::known_token_price(&model) }
+    KnownPrice {
+        per_minute: settings::known_price(&model),
+        tokens: settings::known_token_price(&model),
+        text: settings::known_text_price(&model),
+    }
+}
+
+// AI assistant ------------------------------------------------------------------------
+
+/// Run `work` with an `AiCtx` on the app's state, forwarding events to the window as `ai-event`.
+/// The cancel flag is registered under `key` for `ai_cancel`. Returns Err if that key is already running.
+fn ai_run<F, T>(app: &AppHandle, key: String, work: F) -> CmdResult<tauri::async_runtime::JoinHandle<Result<T, String>>>
+where
+    F: for<'a> FnOnce(&'a ai::AiCtx<'a>) -> futures::future::BoxFuture<'a, anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    use tauri::Emitter;
+    let state = app.state::<AppState>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.ai_jobs.lock().unwrap();
+        if jobs.contains_key(&key) {
+            return Err("Already running".into());
+        }
+        jobs.insert(key.clone(), cancel.clone());
+    }
+    let app = app.clone();
+    Ok(tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let settings = settings::load(&state.settings_path());
+        let emitter = app.clone();
+        let on_event = move |e: ai::AiEvent| {
+            let _ = emitter.emit("ai-event", e);
+        };
+        let ctx = ai::AiCtx { http: &state.http, db: &state.db, settings: &settings, cancel: &cancel, on_event: &on_event };
+        let result = work(&ctx).await.map_err(|e| format!("{e:#}"));
+        state.ai_jobs.lock().unwrap().remove(&key);
+        result
+    }))
+}
+
+/// Summarise a transcript in the background (progress on `ai-event`, key `digest:<id>`).
+#[tauri::command]
+fn ai_digest(app: AppHandle, id: String, force: bool) -> CmdResult<()> {
+    let key = format!("digest:{id}");
+    ai_run(&app, key, move |ctx| Box::pin(async move { ai::digest::digest_transcript(ctx, &id, force).await.map(|_| ()) }))?;
+    Ok(())
+}
+
+/// Called when a transcription finishes: summarise it if the setting is on and it isn't current.
+pub(crate) fn ai_auto_digest(app: &AppHandle, id: &str) {
+    let state = app.state::<AppState>();
+    let s = settings::load(&state.settings_path());
+    if !s.ai_auto_digest || s.providers.iter().find(|p| p.id == s.ai_provider).is_none_or(|p| p.api_key.trim().is_empty()) {
+        return;
+    }
+    let id = id.to_string();
+    let _ = ai_run(app, format!("digest:{id}"), move |ctx| Box::pin(async move { ai::digest::digest_transcript(ctx, &id, false).await.map(|_| ()) }));
+}
+
+#[tauri::command]
+fn ai_get_digests(state: State<AppState>, id: String) -> CmdResult<Vec<ai::store::Digest>> {
+    ai::store::digests_for(&state.db.lock().unwrap(), &id).map_err(err)
+}
+
+/// Keys of AI work currently running.
+#[tauri::command]
+fn ai_running(state: State<AppState>) -> Vec<String> {
+    state.ai_jobs.lock().unwrap().keys().cloned().collect()
+}
+
+#[tauri::command]
+fn ai_cancel(state: State<AppState>, key: String) {
+    if let Some(c) = state.ai_jobs.lock().unwrap().get(&key) {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Ask a question. Returns the thread id at once; tokens stream on `ai-event` and the final
+/// message (or error) arrives on `ai-answer`.
+#[tauri::command]
+fn ai_ask(app: AppHandle, state: State<AppState>, mut params: ai::ask::AskParams) -> CmdResult<String> {
+    use tauri::Emitter;
+    let thread_id = match &params.thread_id {
+        Some(id) => id.clone(),
+        None => {
+            let db = state.db.lock().unwrap();
+            let t = ai::store::create_thread(&db, params.question.trim(), &params.scope).map_err(err)?;
+            t.id
+        }
+    };
+    params.thread_id = Some(thread_id.clone());
+    let tid = thread_id.clone();
+    let app2 = app.clone();
+    ai_run(&app, format!("ask:{thread_id}"), move |ctx| {
+        Box::pin(async move {
+            let r = ai::ask::ask(ctx, params).await;
+            let payload = match &r {
+                Ok(a) => serde_json::json!({ "thread_id": tid, "thread": a.thread, "message": a.message, "note": a.note, "error": null }),
+                Err(e) => serde_json::json!({ "thread_id": tid, "error": format!("{e:#}") }),
+            };
+            let _ = app2.emit("ai-answer", payload);
+            r.map(|_| ())
+        })
+    })?;
+    Ok(thread_id)
+}
+
+#[tauri::command]
+fn ai_list_threads(state: State<AppState>, scope: Option<ai::Scope>) -> CmdResult<Vec<ai::store::Thread>> {
+    ai::store::list_threads(&state.db.lock().unwrap(), scope.as_ref()).map_err(err)
+}
+
+#[derive(serde::Serialize)]
+struct ThreadDetail {
+    thread: ai::store::Thread,
+    messages: Vec<ai::store::Message>,
+}
+
+#[tauri::command]
+fn ai_get_thread(state: State<AppState>, id: String) -> CmdResult<Option<ThreadDetail>> {
+    let db = state.db.lock().unwrap();
+    let Some(thread) = ai::store::get_thread(&db, &id).map_err(err)? else { return Ok(None) };
+    let messages = ai::store::messages_for(&db, &id).map_err(err)?;
+    Ok(Some(ThreadDetail { thread, messages }))
+}
+
+#[tauri::command]
+fn ai_delete_thread(state: State<AppState>, id: String) -> CmdResult<()> {
+    ai::store::delete_thread(&state.db.lock().unwrap(), &id).map_err(err)
+}
+
+/// Hybrid (words + meaning) search; the ⌘K dialog's second section.
+#[tauri::command]
+async fn ai_search(app: AppHandle, query: String, scope: ai::Scope, limit: usize) -> CmdResult<ai::retrieval::Retrieval> {
+    let handle = ai_run(&app, format!("search:{}", uuid::Uuid::new_v4()), move |ctx| {
+        Box::pin(async move { ai::retrieval::retrieve(ctx, &scope, &query, limit.clamp(1, 50)).await })
+    })?;
+    handle.await.map_err(err)?
+}
+
+/// Embed every transcript that isn't indexed yet (progress key `embed:library`).
+#[tauri::command]
+fn ai_embed_library(app: AppHandle) -> CmdResult<()> {
+    ai_run(&app, "embed:library".into(), move |ctx| {
+        Box::pin(async move {
+            let ids: Vec<String> = ai::store::transcripts_in_scope(&ctx.db(), &ai::Scope::Library)?.into_iter().map(|t| t.id).collect();
+            for id in &ids {
+                ai::digest::ensure_chunks(ctx, id)?;
+            }
+            match ai::digest::embed_transcripts(ctx, &ids, "embed:library").await {
+                Ok(n) => ctx.done("embed:library", format!("Indexed {n} part(s)"), None),
+                Err(e) => ctx.done("embed:library", "", Some(format!("{e:#}"))),
+            }
+            Ok(())
+        })
+    })?;
+    Ok(())
+}
+
+/// Project brief (markdown with citations) for a transcript, folder, tag or the library.
+#[tauri::command]
+async fn ai_brief(app: AppHandle, scope: ai::Scope) -> CmdResult<String> {
+    let handle = ai_run(&app, format!("brief:{}", uuid::Uuid::new_v4()), move |ctx| Box::pin(async move { ai::brief::brief(ctx, &scope).await }))?;
+    handle.await.map_err(err)?
+}
+
+/// English translation of a transcript (background; progress key `translate:<id>`, result via `ai_get_digests`).
+#[tauri::command]
+fn ai_translate(app: AppHandle, id: String, force: bool) -> CmdResult<()> {
+    ai_run(&app, format!("translate:{id}"), move |ctx| Box::pin(async move { ai::translate::translate_transcript(ctx, &id, force).await.map(|_| ()) }))?;
+    Ok(())
+}
+
+/// Write text to a file the user picked in a save dialog.
+#[tauri::command]
+fn save_text(path: String, text: String) -> CmdResult<()> {
+    std::fs::write(path, text).map_err(err)
+}
+
+/// One tiny request to check a provider/model/key from Settings.
+#[tauri::command]
+async fn ai_test_connection(app: AppHandle, provider_id: String, model: String) -> CmdResult<String> {
+    let handle = ai_run(&app, format!("test:{}", uuid::Uuid::new_v4()), move |ctx| {
+        Box::pin(async move {
+            let mut cfg = ctx.settings.providers.iter().find(|p| p.id == provider_id).cloned().ok_or_else(|| anyhow::anyhow!("Unknown provider"))?;
+            if !model.trim().is_empty() {
+                cfg.model = model.trim().to_string();
+            }
+            let system = [ai::chat::SystemBlock { text: "Reply with the single word OK.".into(), cache: false }];
+            let msg = [ai::chat::ChatMessage { role: ai::chat::Role::User, content: "Ready?".into() }];
+            let req = ai::chat::ChatRequest { system: &system, messages: &msg, max_tokens: 16, json: false, cached_content: None, temperature: Some(0.0) };
+            let on_retry = |_m: String| {};
+            let call = ai::chat::ChatCall { cancel: ctx.cancel, on_retry: &on_retry, on_delta: None };
+            let r = ai::chat::complete(ctx.http, &cfg, &req, &call).await?;
+            Ok(format!("{} replied: {} ({} in / {} out tokens)", cfg.model, r.text.trim(), r.usage.input_tokens, r.usage.output_tokens))
+        })
+    })?;
+    handle.await.map_err(err)?
 }
 
 // Folders & tags -------------------------------------------------------------------
@@ -523,6 +726,7 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let conn = db::open(&data_dir.join("library.sqlite"))?;
             db::fail_stale(&conn)?;
+            db::backfill_content_hashes(&conn)?;
             let http = reqwest::Client::builder()
                 // Long chunks (25 min with diarization) can take several minutes to process.
                 .timeout(std::time::Duration::from_secs(1800))
@@ -534,6 +738,7 @@ pub fn run() {
                 http,
                 cancels: Mutex::new(HashMap::new()),
                 progress: Mutex::new(HashMap::new()),
+                ai_jobs: Mutex::new(HashMap::new()),
             });
             // Overnight batches finish at Google while the app may be closed; keep checking.
             tauri::async_runtime::spawn(batch::poll_loop(app.handle().clone()));
@@ -570,6 +775,20 @@ pub fn run() {
             delete_version,
             usage_summary,
             known_price,
+            ai_digest,
+            ai_get_digests,
+            ai_running,
+            ai_cancel,
+            ai_ask,
+            ai_list_threads,
+            ai_get_thread,
+            ai_delete_thread,
+            ai_search,
+            ai_embed_library,
+            ai_test_connection,
+            ai_brief,
+            ai_translate,
+            save_text,
             list_folders,
             create_folder,
             rename_folder,

@@ -273,7 +273,7 @@ fn group_words(mut words: Vec<Word>) -> Vec<Segment> {
 
 /// The `generateContent` body used to transcribe one audio chunk with a general Gemini model
 /// (also used for batch requests).
-pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speakers: &[String], previous_text: &str) -> Value {
+pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speakers: &[String], previous_text: &str, glossary: &[String]) -> Value {
     let data = base64::engine::general_purpose::STANDARD.encode(audio);
     let mut prompt = String::from(
         "Transcribe this audio verbatim with speaker diarization. Label speakers consistently as \
@@ -282,6 +282,9 @@ pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speaker
     );
     if let Some(lang) = language {
         prompt.push_str(&format!(" The audio language is {lang}."));
+    }
+    if !glossary.is_empty() {
+        prompt.push_str(&format!(" Names and terms that may come up, spelled this way: {}.", glossary.join(", ")));
     }
     if !known_speakers.is_empty() {
         prompt.push_str(&format!(
@@ -380,7 +383,7 @@ pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
 
 async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
     let bytes = tokio::fs::read(req.path).await?;
-    let body = transcription_request(&bytes, req.language, req.known_speakers, req.previous_text);
+    let body = transcription_request(&bytes, req.language, req.known_speakers, req.previous_text, req.glossary);
     let resp = client
         .post(format!("{}/v1beta/models/{}:generateContent", base(cfg), cfg.model))
         .header("x-goog-api-key", &cfg.api_key)
@@ -473,7 +476,7 @@ mod tests {
     fn only_general_models_fall_back() {
         let cfg = |kind: ProviderKind, model: &str| ProviderConfig {
             id: "g".into(), name: "G".into(), kind, base_url: String::new(), api_key: String::new(), model: model.into(),
-            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None, price_cached_input_per_mtok: None,
         };
         assert_eq!(block_fallback(&cfg(ProviderKind::Gemini, "gemini-3.8-flash")), Some(BLOCK_FALLBACK_MODEL));
         assert_eq!(block_fallback(&cfg(ProviderKind::Gemini, BLOCK_FALLBACK_MODEL)), Some(LAST_RESORT_MODEL));
@@ -489,14 +492,14 @@ mod tests {
         let cfg = ProviderConfig {
             id: "gemini".into(), name: "Gemini".into(), kind: ProviderKind::Gemini,
             base_url: std::env::var("MOCK_BATCH_URL").unwrap(), api_key: "test-key".into(), model: "gemini-3.8-flash".into(),
-            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None, price_cached_input_per_mtok: None,
         };
         let path = std::env::temp_dir().join("fallback-test.ogg");
         std::fs::write(&path, b"fake-audio").unwrap();
         let messages = std::sync::Mutex::new(Vec::new());
         let on_retry = |m: String| messages.lock().unwrap().push(m);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let req = Request { path: &path, duration: 60.0, language: Some("fil"), known_speakers: &[], previous_text: "", on_retry: &on_retry, cancel: &cancel };
+        let req = Request { path: &path, duration: 60.0, language: Some("fil"), known_speakers: &[], previous_text: "", glossary: &[], on_retry: &on_retry, cancel: &cancel };
         let client = reqwest::Client::new();
         let at = |prefix: &str, model: &str| ProviderConfig { base_url: format!("{}{prefix}", cfg.base_url), model: model.into(), ..cfg.clone() };
         let blocked_on = |f: &crate::providers::Fallback| f.blocked.iter().map(|(m, u)| (m.clone(), u.input_tokens)).collect::<Vec<_>>();

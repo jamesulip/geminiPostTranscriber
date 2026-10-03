@@ -46,10 +46,11 @@ pub async fn submit(app: &AppHandle, job: &Job, prepared: &audio::Prepared) -> R
     let state = app.state::<AppState>();
     let language = job.opts.language.as_deref().filter(|l| !l.trim().is_empty());
     let mut jsonl = String::new();
+    let glossary = crate::ai::store::glossary_for_job(&state.db.lock().unwrap(), &job.id);
     for (i, chunk) in prepared.chunks.iter().enumerate() {
         let bytes = tokio::fs::read(&chunk.path).await?;
         // Chunks are independent in a batch, so no "previous speakers" context.
-        jsonl.push_str(&gemini_batch::jsonl_line(&key(i), &transcription_request(&bytes, language, &[], "")));
+        jsonl.push_str(&gemini_batch::jsonl_line(&key(i), &transcription_request(&bytes, language, &[], "", &glossary)));
         jsonl.push('\n');
     }
     let title: String = {
@@ -122,9 +123,12 @@ fn finish(app: &AppHandle, id: &str, error: Option<String>) {
             progress: 1.0,
             message: error.clone().unwrap_or_else(|| "Done".into()),
             done: true,
-            error,
+            error: error.clone(),
         },
     );
+    if error.is_none() {
+        crate::ai_auto_digest(app, id);
+    }
 }
 
 /// Check every pending batch once; save finished ones.
@@ -315,7 +319,8 @@ fn record_usage(
     db::insert_usage(
         &db,
         &db::NewUsage {
-            transcript_id: id,
+            kind: "transcribe",
+            transcript_id: Some(id),
             title: &title,
             provider: &cfg.id,
             provider_name: &format!("{} (batch)", cfg.name),
