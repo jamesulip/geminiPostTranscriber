@@ -1,4 +1,5 @@
 mod audio;
+mod batch;
 mod db;
 mod export;
 mod jobs;
@@ -92,6 +93,9 @@ fn spawn_job_with(
         provider.model = m.trim().to_string();
     }
     opts.model = Some(provider.model.clone());
+    if opts.batch && (provider.kind != settings::ProviderKind::Gemini || provider.model.contains("transcribe")) {
+        return Err("Overnight batch needs a general Gemini model such as gemini-3.8-flash (Gemini 3.5 Transcribe has no batch mode).".into());
+    }
     // Repairs reuse the last full run's options; only full runs define them (and its chunk cache).
     if repair.is_none() {
         if let Ok(json) = serde_json::to_string(&opts) {
@@ -222,10 +226,30 @@ fn job_progress(state: State<AppState>) -> Vec<jobs::Progress> {
 }
 
 #[tauri::command]
-fn cancel_job(state: State<AppState>, id: String) {
+fn cancel_job(app: AppHandle, state: State<AppState>, id: String) {
     if let Some(c) = state.cancels.lock().unwrap().get(&id) {
         c.store(true, Ordering::Relaxed);
+        return;
     }
+    // Not running locally: maybe an overnight batch waiting at Google.
+    let queued = db::get_transcript(&state.db.lock().unwrap(), &id)
+        .ok()
+        .flatten()
+        .is_some_and(|t| t.summary.status == "queued");
+    if queued {
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = batch::cancel(&app, &id).await {
+                eprintln!("cancel batch {id}: {e:#}");
+            }
+        });
+    }
+}
+
+/// Check overnight batches at Google right away (instead of waiting for the next round).
+#[tauri::command]
+async fn check_batches(app: AppHandle) -> CmdResult<()> {
+    batch::poll(&app).await;
+    Ok(())
 }
 
 // Library -----------------------------------------------------------------------
@@ -252,7 +276,15 @@ fn update_transcript(
 }
 
 #[tauri::command]
-fn delete_transcript(state: State<AppState>, id: String) -> CmdResult<()> {
+fn delete_transcript(app: AppHandle, state: State<AppState>, id: String) -> CmdResult<()> {
+    // Stop a pending overnight batch so Google doesn't keep working (and billing) on it.
+    let queued = db::get_transcript(&state.db.lock().unwrap(), &id).ok().flatten().is_some_and(|t| t.summary.status == "queued");
+    if queued {
+        let (app, id) = (app.clone(), id.clone());
+        tauri::async_runtime::spawn(async move {
+            let _ = batch::cancel(&app, &id).await;
+        });
+    }
     if let Some(c) = state.cancels.lock().unwrap().get(&id) {
         c.store(true, Ordering::Relaxed);
     }
@@ -400,6 +432,8 @@ pub fn run() {
                 cancels: Mutex::new(HashMap::new()),
                 progress: Mutex::new(HashMap::new()),
             });
+            // Overnight batches finish at Google while the app may be closed; keep checking.
+            tauri::async_runtime::spawn(batch::poll_loop(app.handle().clone()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -412,6 +446,7 @@ pub fn run() {
             repair_transcript,
             cancel_job,
             job_progress,
+            check_batches,
             list_transcripts,
             get_transcript,
             update_transcript,

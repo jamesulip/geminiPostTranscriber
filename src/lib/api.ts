@@ -33,6 +33,9 @@ export interface Settings {
   language: string;
   speed: number;
   diarize_speed: number;
+  /** Model for "Overnight (batch)" jobs. */
+  batch_model: string;
+  batch_chunk_minutes: number;
   remove_silence: boolean;
   silence_method: SilenceMethod;
   vad_threshold: number;
@@ -54,7 +57,8 @@ export interface Tag {
   color: string;
 }
 
-export type Status = "processing" | "done" | "error";
+/** "queued": sent to Google as an overnight batch, waiting for results. */
+export type Status = "processing" | "queued" | "done" | "error";
 
 export interface TranscriptSummary {
   id: string;
@@ -160,6 +164,8 @@ export interface TranscriptDetail extends TranscriptSummary {
   last_options: Partial<JobOptions> | null;
   /** Chunks finished so far by the current (running or failed) job. */
   partial: { done: number; total: number; segments: Omit<SegmentRow, "id" | "idx">[] } | null;
+  /** Pending overnight batch while status is "queued". */
+  batch: { submitted_at: string; chunks: number | null; model: string } | null;
   segments: SegmentRow[];
   speakers: Speaker[];
   usage: UsageTotals;
@@ -185,6 +191,8 @@ export interface JobOptions {
   chunk_minutes: number;
   silence_method: SilenceMethod;
   vad_threshold: number;
+  /** Send through the Gemini Batch API (cheaper, results within 24 h). */
+  batch: boolean;
   title: string | null;
   folder_id: number | null;
   tag_ids: number[];
@@ -229,6 +237,7 @@ export const api = {
     invoke<void>("repair_transcript", { id, ranges, options }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
   jobProgress: () => invoke<Progress[]>("job_progress"),
+  checkBatches: () => invoke<void>("check_batches"),
 
   listTranscripts: (filter: ListFilter) => invoke<TranscriptSummary[]>("list_transcripts", { filter }),
   getTranscript: (id: string) => invoke<TranscriptDetail | null>("get_transcript", { id }),

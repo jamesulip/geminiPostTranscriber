@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { AlertCircle, Folder, Loader2 } from "@lucide/vue";
+import { AlertCircle, Folder, Loader2, Moon } from "@lucide/vue";
 import { Progress } from "@/components/ui/progress";
 import type { TranscriptSummary } from "@/lib/api";
 import { formatDuration } from "@/lib/format";
@@ -27,7 +27,10 @@ const saved = computed(() =>
       <TranscriptMeta :t="t" />
     </div>
 
-    <div v-if="t.status === 'processing'" class="grid gap-1.5">
+    <div v-if="t.status === 'queued'" class="text-muted-foreground flex items-center gap-1.5 text-xs">
+      <Moon class="size-3.5" /> {{ job?.message ?? "Overnight batch — waiting at Google" }}
+    </div>
+    <div v-else-if="t.status === 'processing'" class="grid gap-1.5">
       <div class="text-muted-foreground flex items-center gap-1.5 text-xs">
         <Loader2 class="size-3.5 animate-spin" /> {{ job?.message ?? "Processing…" }}
       </div>

@@ -26,7 +26,8 @@ export const useJobs = defineStore("jobs", () => {
         delete progress[p.id];
         const wasCancelled = cancelling.delete(p.id) && p.error === "Cancelled";
         const title = library.transcripts.find((t) => t.id === p.id)?.title ?? "Transcript";
-        if (wasCancelled) toast(`${title} cancelled`, { description: "Finished chunks are kept; Retry continues from there." });
+        if (p.stage === "queued") toast(`${title}: sent as an overnight batch`, { description: "Results usually arrive within 24 hours. Keep the app open now and then to collect them." });
+        else if (wasCancelled) toast(`${title} cancelled`, { description: "Finished chunks are kept; Retry continues from there." });
         else if (p.error) toast.error(`${title} failed`, { description: p.error });
         else toast.success(`${title} transcribed`);
       } else {

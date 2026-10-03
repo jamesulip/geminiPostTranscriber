@@ -21,8 +21,8 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     } else {
         form.text("response_format", "verbose_json").text("timestamp_granularities[]", "segment")
     };
-    if let Some(lang) = req.language {
-        form = form.text("language", lang.to_string());
+    if let Some(lang) = req.language.and_then(whisper_language) {
+        form = form.text("language", lang);
     }
     if !plain && !req.previous_text.is_empty() && !diarize {
         // Whisper uses the prompt as preceding context, which helps continuity between chunks.
@@ -34,6 +34,20 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let resp = client.post(url).bearer_auth(&cfg.api_key).multipart(form).send().await?;
     let body: Value = check(resp).await.context("transcribing")?.json().await.context("invalid JSON from provider")?;
     Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body), language: extract_language(&body), raw: Some(body) })
+}
+
+/// Whisper-style APIs only accept ISO 639-1 codes ("tl", "en"); Gemini accepts others ("fil").
+/// Maps common forms and drops region suffixes; unknown values are left out (auto-detect).
+fn whisper_language(lang: &str) -> Option<String> {
+    let l = lang.trim().to_lowercase();
+    let base = l.split(['-', '_']).next().unwrap_or("");
+    let code = match base {
+        "fil" | "filipino" | "tagalog" | "taglish" => "tl",
+        "english" => "en",
+        other if other.len() == 2 && other.chars().all(|c| c.is_ascii_alphabetic()) => other,
+        _ => return None,
+    };
+    Some(code.to_string())
 }
 
 fn parse(body: &Value, duration: f64) -> Vec<Segment> {
@@ -65,6 +79,16 @@ fn parse(body: &Value, duration: f64) -> Vec<Segment> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn maps_languages_for_whisper() {
+        assert_eq!(whisper_language("fil").as_deref(), Some("tl"));
+        assert_eq!(whisper_language("fil-PH").as_deref(), Some("tl"));
+        assert_eq!(whisper_language("Filipino").as_deref(), Some("tl"));
+        assert_eq!(whisper_language("en-US").as_deref(), Some("en"));
+        assert_eq!(whisper_language("tl").as_deref(), Some("tl"));
+        assert_eq!(whisper_language("xyz"), None);
+    }
 
     #[test]
     fn parses_verbose_json() {

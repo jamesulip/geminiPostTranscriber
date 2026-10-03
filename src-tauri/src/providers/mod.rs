@@ -1,4 +1,5 @@
 pub mod gemini;
+pub mod gemini_batch;
 pub mod openai_compat;
 
 use crate::settings::{ProviderConfig, ProviderKind};

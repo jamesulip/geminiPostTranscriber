@@ -20,11 +20,25 @@ export function defaultOptions(s: Settings, providerId = s.default_provider): Jo
     vad_threshold: s.vad_threshold,
     silence_threshold_db: s.silence_threshold_db,
     silence_min_duration: s.silence_min_duration,
+    batch: false,
     title: null,
     folder_id: null,
     tag_ids: [],
   };
 }
+/** Options for an "Overnight (batch)" job: Gemini general model via the Batch API, speaker labels via prompt. */
+export function batchOptions(s: Settings, base: JobOptions): JobOptions {
+  const gemini = s.providers.find((p) => p.id === s.diarize_provider && p.kind === "gemini") ?? s.providers.find((p) => p.kind === "gemini");
+  return {
+    ...base,
+    batch: true,
+    provider_id: gemini?.id ?? base.provider_id,
+    model: s.batch_model,
+    speed: s.diarize_speed,
+    chunk_minutes: s.batch_chunk_minutes,
+  };
+}
+
 /** Clean up form values before sending to the backend. */
 export function normalizeOptions(o: JobOptions): JobOptions {
   return {

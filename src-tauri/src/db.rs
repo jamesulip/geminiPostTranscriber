@@ -27,6 +27,7 @@ fn migrate(c: &Connection) -> Result<()> {
         ("last_options", "TEXT"),
         ("notes", "TEXT"),
         ("partial", "TEXT"),
+        ("batch", "TEXT"),
     ] {
         if !cols.iter().any(|c| c == name) {
             c.execute_batch(&format!("ALTER TABLE transcripts ADD COLUMN {name} {ty}"))?;
@@ -210,6 +211,8 @@ pub struct TranscriptDetail {
     pub last_options: Option<serde_json::Value>,
     /// Text from the chunks finished so far by the current (running or failed) job.
     pub partial: Option<serde_json::Value>,
+    /// Pending overnight batch (submitted time, chunk count, …) while status is "queued".
+    pub batch: Option<serde_json::Value>,
     pub segments: Vec<SegmentRow>,
     pub speakers: Vec<Speaker>,
     pub usage: UsageTotals,
@@ -267,6 +270,19 @@ pub fn set_recording_meta(c: &Connection, id: &str, recorded_at: Option<&str>, d
 }
 
 /// Store (or clear) the partial transcript of a running/failed job.
+/// Store (or clear) the pending batch job of a transcript (JSON, see `batch::BatchMeta`).
+pub fn set_batch(c: &Connection, id: &str, batch: Option<&str>) -> Result<()> {
+    c.execute("UPDATE transcripts SET batch = ?2 WHERE id = ?1", params![id, batch])?;
+    Ok(())
+}
+
+/// Transcripts waiting for a Google batch: (id, batch JSON).
+pub fn queued_batches(c: &Connection) -> Result<Vec<(String, String)>> {
+    let mut st = c.prepare("SELECT id, batch FROM transcripts WHERE status = 'queued' AND batch IS NOT NULL")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 pub fn set_partial(c: &Connection, id: &str, partial: Option<&str>) -> Result<()> {
     c.execute("UPDATE transcripts SET partial = ?2 WHERE id = ?1", params![id, partial])?;
     Ok(())
@@ -585,7 +601,7 @@ fn speakers_for(c: &Connection, id: &str) -> Result<Vec<Speaker>> {
 }
 
 pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetail>> {
-    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path, t.last_options, t.partial FROM transcripts t WHERE t.id = ?1");
+    let sql = format!("SELECT {SUMMARY_COLS}, t.audio_path, t.last_options, t.partial, t.batch FROM transcripts t WHERE t.id = ?1");
     let row = c
         .query_row(&sql, [id], |r| {
             Ok((
@@ -593,10 +609,15 @@ pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetai
                 r.get::<_, String>(17)?,
                 r.get::<_, Option<String>>(18)?,
                 r.get::<_, Option<String>>(19)?,
+                r.get::<_, Option<String>>(20)?,
             ))
         })
         .optional()?;
-    let Some((mut summary, audio_path, last_options, partial)) = row else { return Ok(None) };
+    let Some((mut summary, audio_path, last_options, partial, batch)) = row else { return Ok(None) };
+    // Only the public parts of the batch info (not the time map).
+    let batch = batch.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).map(|b| {
+        serde_json::json!({ "submitted_at": b["submitted_at"], "chunks": b["chunks"].as_array().map(|c| c.len()), "model": b["model"] })
+    });
     let last_options = last_options.and_then(|s| serde_json::from_str(&s).ok());
     let partial = partial.and_then(|s| serde_json::from_str(&s).ok());
     summary.tags = tags_for(c, id)?;
@@ -604,7 +625,7 @@ pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetai
     let segments = segments_for(c, id)?;
     let speakers = speakers_for(c, id)?;
     let usage = usage_for_transcript(c, id)?;
-    Ok(Some(TranscriptDetail { summary, audio_path, last_options, partial, segments, speakers, usage }))
+    Ok(Some(TranscriptDetail { summary, audio_path, last_options, partial, batch, segments, speakers, usage }))
 }
 
 pub fn update_transcript(c: &Connection, id: &str, title: &str, folder_id: Option<i64>, tag_ids: &[i64]) -> Result<()> {

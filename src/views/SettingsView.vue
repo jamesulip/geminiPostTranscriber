@@ -171,6 +171,15 @@ async function save() {
               <p class="text-muted-foreground text-xs">Used when “Speaker labels” is switched on.</p>
             </div>
             <div class="grid gap-1.5"><Label>Language</Label><Input v-model="form.language" placeholder="Auto-detect" /></div>
+            <div class="grid gap-1.5">
+              <Label>Overnight (batch) model</Label>
+              <Input v-model="form.batch_model" placeholder="gemini-3.8-flash" />
+              <p class="text-muted-foreground text-xs">Gemini model used via the Batch API (~50% cheaper, results within 24 h).</p>
+            </div>
+            <div class="grid gap-1.5">
+              <Label>Chunk length — overnight (min)</Label>
+              <Input v-model.number="form.batch_chunk_minutes" type="number" min="1" max="30" />
+            </div>
             <div />
             <div class="grid gap-1.5">
               <Label>Speed — text only (1.0–2.0)</Label>

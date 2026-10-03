@@ -24,6 +24,13 @@ Then open **Settings** and paste an API key for Groq, OpenAI, and/or Gemini.
 Data (SQLite library, copied audio, `settings.json`) lives in the app data dir,
 e.g. `~/Library/Application Support/ph.tigergraphics.transcriber/`. API keys are stored there in plain text.
 
+## Now vs Overnight
+- **Now**: Gemini 3.5 Transcribe (speaker labels) or Groq (text only); results in minutes, subject to rate limits.
+- **Overnight (batch)**: Gemini 3.8 Flash through the Gemini Batch API — ~50% cheaper, speaker labels via prompt,
+  results within 24 h. Pending batches survive app restarts; the app checks every 3 min while open.
+  Test the API flow with `python3 scripts/mock_gemini_batch.py` and
+  `MOCK_BATCH_URL=http://127.0.0.1:8766 cargo test batch_flow -- --ignored`.
+
 ## Long recordings (1–6 h)
 - Preprocessing streams audio: ~10 s per hour of audio, ~20 MB RAM regardless of length.
 - Rate limits are retried using the provider's `Retry-After` (up to 6 attempts).

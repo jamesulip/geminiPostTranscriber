@@ -32,8 +32,18 @@ pub struct ProviderConfig {
 /// Published token prices (USD per 1M input, 1M output) for models billed by tokens.
 pub fn known_token_price(model: &str) -> Option<(f64, f64)> {
     let m = model.to_lowercase();
-    m.contains("gemini-3.5-transcribe").then_some((2.0, 12.0))
+    // Audio input / text output rates (Oct 2026). 3.8 Flash is on introductory pricing until Dec 31, 2026.
+    let table: &[(&str, (f64, f64))] = &[
+        ("gemini-3.5-transcribe", (2.0, 12.0)),
+        ("gemini-3.8-flash-lite", (0.50, 2.50)),
+        ("gemini-3.8-flash", (0.75, 3.75)),
+        ("gemini-3.1-flash-lite", (0.50, 1.50)),
+    ];
+    table.iter().find(|(k, _)| m.contains(k)).map(|(_, p)| *p)
 }
+
+/// The Gemini Batch API bills half the normal rate.
+pub const BATCH_DISCOUNT: f64 = 0.5;
 
 /// Published list prices (USD per audio minute) for common models, used for estimates.
 pub fn known_price(model: &str) -> f64 {
@@ -105,6 +115,10 @@ pub struct Settings {
     pub chunk_minutes: f64,
     /// Chunk length for Gemini. Diarization requests are limited to 30 min of audio.
     pub gemini_chunk_minutes: f64,
+    /// Model for "Overnight (batch)" jobs via the Gemini Batch API (~50% cheaper, results within 24 h).
+    pub batch_model: String,
+    /// Chunk length for batch jobs.
+    pub batch_chunk_minutes: f64,
 }
 
 impl Default for Settings {
@@ -158,6 +172,8 @@ impl Default for Settings {
             silence_min_duration: 0.7,
             chunk_minutes: 10.0,
             gemini_chunk_minutes: 10.0,
+            batch_model: "gemini-3.8-flash".into(),
+            batch_chunk_minutes: 10.0,
         }
     }
 }

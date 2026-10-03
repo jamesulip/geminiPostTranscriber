@@ -27,6 +27,9 @@ pub struct JobOptions {
     pub silence_method: crate::settings::SilenceMethod,
     #[serde(default = "default_vad_threshold")]
     pub vad_threshold: f64,
+    /// Send through the Gemini Batch API instead of transcribing now (cheaper, results within 24 h).
+    #[serde(default)]
+    pub batch: bool,
     pub title: Option<String>,
     pub folder_id: Option<i64>,
     #[serde(default)]
@@ -64,7 +67,7 @@ pub struct Job {
     pub repair: Option<Vec<audio::Interval>>,
 }
 
-fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Into<String>) {
+pub fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Into<String>) {
     let p = Progress { id: id.into(), stage: stage.into(), progress, message: message.into(), done: false, error: None };
     // Remember the latest status so a reloaded window can show it again.
     if let Some(state) = app.try_state::<AppState>() {
@@ -165,9 +168,27 @@ pub async fn run(app: AppHandle, job: Job) {
     let meter = Mutex::new(Meter::default());
     let cache = ChunkCache::new(&state.cache_dir, &job);
     let result = match &job.repair {
-        Some(ranges) => execute_repair(&app, &job, &work, &meter, ranges).await,
+        Some(ranges) => execute_repair(&app, &job, &work, &meter, ranges).await.map(|_| false),
         None => execute(&app, &job, &work, &meter, &cache).await,
     };
+    // Submitted as a batch: Google finishes it later; `batch::poll` saves the result.
+    if matches!(result, Ok(true)) {
+        let _ = std::fs::remove_dir_all(&work);
+        state.cancels.lock().unwrap().remove(&job.id);
+        state.progress.lock().unwrap().remove(&job.id);
+        let _ = app.emit(
+            "job-progress",
+            Progress {
+                id: job.id.clone(),
+                stage: "queued".into(),
+                progress: 1.0,
+                message: "Sent to Google as an overnight batch".into(),
+                done: true,
+                error: None,
+            },
+        );
+        return;
+    }
     let _ = std::fs::remove_dir_all(&work);
     if result.is_ok() {
         cache.clear();
@@ -231,13 +252,14 @@ pub async fn run(app: AppHandle, job: Job) {
     );
 }
 
+/// Returns `true` when the job was handed to Google as a batch (finished later by the poller).
 async fn execute(
     app: &AppHandle,
     job: &Job,
     work: &std::path::Path,
     meter: &Mutex<Meter>,
     cache: &ChunkCache,
-) -> Result<()> {
+) -> Result<bool> {
     let state = app.state::<AppState>();
     let id = job.id.as_str();
     let cancelled = || job.cancel.load(Ordering::Relaxed);
@@ -287,6 +309,11 @@ async fn execute(
     );
     if cancelled() {
         bail!("Cancelled");
+    }
+    if o.batch {
+        emit(app, id, "batch", 0.6, format!("Sending {n} chunk(s) to Google as an overnight batch"));
+        crate::batch::submit(app, job, &prepared).await?;
+        return Ok(true);
     }
 
     let language = o.language.as_deref().filter(|l| !l.trim().is_empty());
@@ -402,7 +429,7 @@ async fn execute(
             processed_duration: prepared.processed_duration,
         },
     )?;
-    Ok(())
+    Ok(false)
 }
 
 /// Re-transcribe only `ranges` of the original audio and splice the results into the current

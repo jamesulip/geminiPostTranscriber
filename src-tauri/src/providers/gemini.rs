@@ -20,7 +20,7 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     }
 }
 
-fn base(cfg: &ProviderConfig) -> &str {
+pub fn base(cfg: &ProviderConfig) -> &str {
     cfg.base_url.trim_end_matches('/')
 }
 
@@ -40,21 +40,32 @@ async fn transcribe_model(client: &reqwest::Client, cfg: &ProviderConfig, req: &
     result
 }
 
-struct UploadedFile {
-    name: String,
-    uri: String,
+pub struct UploadedFile {
+    pub name: String,
+    pub uri: String,
 }
 
 async fn upload(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<UploadedFile> {
     let bytes = tokio::fs::read(req.path).await?;
+    upload_bytes(client, cfg, bytes, MIME, "transcriber-chunk").await
+}
+
+/// Upload bytes with the Files API (resumable protocol) and wait until the file is usable.
+pub async fn upload_bytes(
+    client: &reqwest::Client,
+    cfg: &ProviderConfig,
+    bytes: Vec<u8>,
+    mime: &str,
+    display_name: &str,
+) -> Result<UploadedFile> {
     let start = client
         .post(format!("{}/upload/v1beta/files", base(cfg)))
         .header("x-goog-api-key", &cfg.api_key)
         .header("X-Goog-Upload-Protocol", "resumable")
         .header("X-Goog-Upload-Command", "start")
         .header("X-Goog-Upload-Header-Content-Length", bytes.len().to_string())
-        .header("X-Goog-Upload-Header-Content-Type", MIME)
-        .json(&json!({"file": {"display_name": "transcriber-chunk"}}))
+        .header("X-Goog-Upload-Header-Content-Type", mime)
+        .json(&json!({"file": {"display_name": display_name, "mime_type": mime}}))
         .send()
         .await?;
     let start = check(start).await?;
@@ -260,26 +271,27 @@ fn group_words(mut words: Vec<Word>) -> Vec<Segment> {
 // generateContent fallback (general Gemini models)
 // ---------------------------------------------------------------------------
 
-async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
-    let bytes = tokio::fs::read(req.path).await?;
-    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+/// The `generateContent` body used to transcribe one audio chunk with a general Gemini model
+/// (also used for batch requests).
+pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speakers: &[String], previous_text: &str) -> Value {
+    let data = base64::engine::general_purpose::STANDARD.encode(audio);
     let mut prompt = String::from(
         "Transcribe this audio verbatim with speaker diarization. Label speakers consistently as \
          \"Speaker 1\", \"Speaker 2\", etc. Return segments of one to a few sentences with start and \
          end timestamps in seconds from the beginning of this audio.",
     );
-    if let Some(lang) = req.language {
+    if let Some(lang) = language {
         prompt.push_str(&format!(" The audio language is {lang}."));
     }
-    if !req.known_speakers.is_empty() {
+    if !known_speakers.is_empty() {
         prompt.push_str(&format!(
             " This audio continues an earlier recording. Speakers identified so far: {}. Reuse these labels \
              for the same voices. The previous part ended with: \"{}\"",
-            req.known_speakers.join(", "),
-            req.previous_text.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+            known_speakers.join(", "),
+            previous_text.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect::<String>()
         ));
     }
-    let body = json!({
+    json!({
         "contents": [{"parts": [
             {"inline_data": {"mime_type": MIME, "data": data}},
             {"text": prompt}
@@ -300,7 +312,26 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
                 }
             }
         }
-    });
+    })
+}
+
+/// Segments + usage from a `generateContent` response (or a batch result line's `response`).
+pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
+    let candidate = v.get("candidates").and_then(|c| c.get(0)).ok_or_else(|| anyhow!("Gemini returned no result"))?;
+    let text: String = candidate["content"]["parts"]
+        .as_array()
+        .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        let reason = candidate["finishReason"].as_str().or(candidate["finish_reason"].as_str()).unwrap_or("unknown");
+        bail!("Gemini returned no text (finish reason: {reason})");
+    }
+    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(v), language: None, raw: Some(v.clone()) })
+}
+
+async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
+    let bytes = tokio::fs::read(req.path).await?;
+    let body = transcription_request(&bytes, req.language, req.known_speakers, req.previous_text);
     let resp = client
         .post(format!("{}/v1beta/models/{}:generateContent", base(cfg), cfg.model))
         .header("x-goog-api-key", &cfg.api_key)
@@ -309,14 +340,10 @@ async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &
         .send()
         .await?;
     let v: Value = check(resp).await?.json().await?;
-    let text: String = v["candidates"][0]["content"]["parts"]
-        .as_array()
-        .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
-        .unwrap_or_default();
-    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(&v), language: None, raw: Some(v) })
+    parse_generate_response(&v)
 }
 
-fn parse_json_segments(text: &str) -> Result<Vec<Segment>> {
+pub fn parse_json_segments(text: &str) -> Result<Vec<Segment>> {
     let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```");
     let arr: Vec<Value> = serde_json::from_str(cleaned.trim()).context("Gemini returned invalid JSON")?;
     Ok(arr

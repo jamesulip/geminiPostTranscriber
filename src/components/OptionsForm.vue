@@ -6,7 +6,7 @@ import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { diarizes, type JobOptions, type SilenceMethod, type Settings } from "@/lib/api";
-import { providerDefaults } from "@/lib/options";
+import { batchOptions, defaultOptions, providerDefaults } from "@/lib/options";
 
 const opts = defineModel<JobOptions>({ required: true });
 const props = defineProps<{ settings: Settings }>();
@@ -20,7 +20,8 @@ const effective = computed(() =>
 watch(
   () => opts.value.provider_id,
   (id, old) => {
-    if (!old || id === old) return;
+    // Overnight mode sets its own provider/model/chunking (see setWhen).
+    if (!old || id === old || opts.value.batch) return;
     const p = props.settings.providers.find((x) => x.id === id);
     opts.value.model = p?.model ?? null;
     Object.assign(opts.value, providerDefaults(props.settings, p));
@@ -58,13 +59,51 @@ const method = computed({
   get: () => opts.value.silence_method,
   set: (v: string) => (opts.value.silence_method = v as SilenceMethod),
 });
+/** "Now" (fast) vs "Overnight" (Gemini Batch API: ~50% cheaper, results within 24 h). */
+const hasGemini = computed(() => props.settings.providers.some((p) => p.kind === "gemini"));
+function setWhen(batch: boolean) {
+  if (batch === opts.value.batch) return;
+  const keep = { language: opts.value.language, title: opts.value.title, folder_id: opts.value.folder_id, tag_ids: opts.value.tag_ids };
+  const base = defaultOptions(props.settings);
+  opts.value = { ...(batch ? batchOptions(props.settings, base) : base), ...keep };
+}
+
 const providerName = (id: string) => props.settings.providers.find((p) => p.id === id)?.name ?? id;
 const missingKey = computed(() => provider.value && !provider.value.api_key.trim());
 </script>
 
 <template>
   <div class="grid gap-4">
-    <div class="flex items-start justify-between gap-4 rounded-lg border p-3">
+    <div class="grid gap-1.5">
+      <Label>When</Label>
+      <div class="grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          class="rounded-lg border p-3 text-left transition-colors"
+          :class="!opts.batch ? 'border-primary bg-primary/5' : 'hover:bg-accent/50'"
+          @click="setWhen(false)"
+        >
+          <p class="text-sm font-medium">Now</p>
+          <p class="text-muted-foreground text-xs">Results in minutes. Subject to rate limits.</p>
+        </button>
+        <button
+          type="button"
+          class="rounded-lg border p-3 text-left transition-colors disabled:opacity-50"
+          :class="opts.batch ? 'border-primary bg-primary/5' : 'hover:bg-accent/50'"
+          :disabled="!hasGemini"
+          @click="setWhen(true)"
+        >
+          <p class="text-sm font-medium">Overnight (batch)</p>
+          <p class="text-muted-foreground text-xs">~50% cheaper, with speaker labels. Results within 24 h, often sooner.</p>
+        </button>
+      </div>
+      <p v-if="opts.batch" class="text-muted-foreground text-xs">
+        Uses <code>{{ opts.model }}</code> through Google's Batch API. You can close the app; it checks for results when
+        it's open. Speaker labels and timings come from the model's prompt, so they're a little less precise than Gemini 3.5 Transcribe.
+      </p>
+    </div>
+
+    <div v-if="!opts.batch" class="flex items-start justify-between gap-4 rounded-lg border p-3">
       <div class="grid gap-0.5">
         <Label for="speaker-labels">Speaker labels</Label>
         <p class="text-muted-foreground text-xs">
@@ -79,7 +118,7 @@ const missingKey = computed(() => provider.value && !provider.value.api_key.trim
     <div class="grid grid-cols-2 gap-3">
       <div class="grid gap-1.5">
         <Label>Provider</Label>
-        <Select v-model="opts.provider_id">
+        <Select v-model="opts.provider_id" :disabled="opts.batch">
           <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem v-for="p in settings.providers" :key="p.id" :value="p.id">{{ p.name }}</SelectItem>

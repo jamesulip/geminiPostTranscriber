@@ -7,7 +7,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
   AlertCircle, AlertTriangle, ArrowLeft, Check, Download, History, Loader2, LocateFixed, MoreHorizontal, Pause, PauseCircle, Play,
-  RefreshCw, RotateCcw, Search, Shrink, Trash2, Wrench,
+  Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, Wrench,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -76,6 +76,17 @@ function openSpeakerMenu(seg: SegmentRow, anchor: HTMLElement) {
 const renaming = ref<string | null>(null);
 const retry = ref<JobOptions | null>(null);
 const fixing = ref(false);
+const checking = ref(false);
+
+async function checkNow() {
+  checking.value = true;
+  try {
+    await api.checkBatches();
+    await load();
+  } finally {
+    checking.value = false;
+  }
+}
 
 async function openFix() {
   await settingsStore.load();
@@ -415,11 +426,11 @@ const saved = computed(() =>
       <DropdownMenu>
         <DropdownMenuTrigger as-child><Button variant="ghost" size="icon"><MoreHorizontal /></Button></DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem :disabled="t.status === 'processing' || !t.segments.length || !!viewing" @click="openFix">
+          <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued' || !t.segments.length || !!viewing" @click="openFix">
             <Wrench /> Fix problems…
           </DropdownMenuItem>
-          <DropdownMenuItem :disabled="t.status === 'processing'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
-          <DropdownMenuItem v-if="t.status === 'processing'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
+          <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
+          <DropdownMenuItem v-if="t.status === 'processing' || t.status === 'queued'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem variant="destructive" @click="remove"><Trash2 /> Delete</DropdownMenuItem>
         </DropdownMenuContent>
@@ -530,7 +541,25 @@ const saved = computed(() =>
     </section>
 
     <!-- Status -->
-    <div v-if="t.status === 'processing'" class="flex flex-col items-center justify-center gap-3" :class="showingPartial ? 'border-b p-4' : 'p-10'">
+    <div v-if="t.status === 'queued'" class="m-6 flex items-start gap-3 rounded-xl border p-4">
+      <Moon class="text-primary mt-0.5 size-5 shrink-0" />
+      <div class="min-w-0 flex-1">
+        <p class="font-medium">Overnight batch — waiting at Google</p>
+        <p class="text-muted-foreground mt-1 text-sm">
+          {{ job?.message ?? "Google usually finishes within 24 hours, often much sooner." }}
+        </p>
+        <p v-if="t.batch" class="text-muted-foreground mt-1 text-xs">
+          Sent {{ formatDate(t.batch.submitted_at) }} · {{ t.batch.chunks }} chunk(s) · {{ t.batch.model }} · the app checks every few minutes while it's open
+        </p>
+      </div>
+      <div class="flex shrink-0 gap-2">
+        <Button variant="outline" size="sm" :disabled="checking" @click="checkNow"><RefreshCw /> Check now</Button>
+        <Button variant="ghost" size="sm" :disabled="jobs.cancelling.has(t.id)" @click="jobs.cancel(t.id)">
+          {{ jobs.cancelling.has(t.id) ? "Cancelling…" : "Cancel" }}
+        </Button>
+      </div>
+    </div>
+    <div v-else-if="t.status === 'processing'" class="flex flex-col items-center justify-center gap-3" :class="showingPartial ? 'border-b p-4' : 'p-10'">
       <Loader2 class="text-primary size-8 animate-spin" />
       <p class="text-sm">{{ jobs.cancelling.has(t.id) ? "Cancelling…" : job?.message ?? "Processing…" }}</p>
       <Progress :model-value="(job?.progress ?? 0.02) * 100" class="h-1.5 w-80" />
