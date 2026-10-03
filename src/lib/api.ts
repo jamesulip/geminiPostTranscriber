@@ -36,6 +36,8 @@ export interface Settings {
   /** Model for "Overnight (batch)" jobs. */
   batch_model: string;
   batch_chunk_minutes: number;
+  /** Re-do batch parts Google blocked/left empty right away with the speaker-label provider. */
+  batch_retry_failed: boolean;
   remove_silence: boolean;
   silence_method: SilenceMethod;
   vad_threshold: number;
@@ -222,6 +224,23 @@ export interface ProblemRange {
   kind: "text" | "speakers";
 }
 
+/** One overnight batch (Google's live status merged with the app's records). */
+export interface BatchView {
+  name: string;
+  title: string;
+  transcript_id: string | null;
+  model: string;
+  state: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "EXPIRED" | string;
+  created: string | null;
+  ended: string | null;
+  parts: number | null;
+  /** Parts the app found blocked or empty (Google still reports those as succeeded). */
+  blocked: number | null;
+  retried: boolean;
+  cost_usd: number | null;
+  outcome: string | null;
+}
+
 export type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 
 export const api = {
@@ -233,11 +252,13 @@ export const api = {
     invoke<string>("start_transcription", { path, options }),
   retranscribe: (id: string, options: JobOptions) => invoke<void>("retranscribe", { id, options }),
   findProblems: (id: string) => invoke<ProblemRange[]>("find_problems", { id }),
+  speechInGaps: (id: string, gaps: [number, number][]) => invoke<number[]>("speech_in_gaps", { id, gaps }),
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
   jobProgress: () => invoke<Progress[]>("job_progress"),
   checkBatches: () => invoke<void>("check_batches"),
+  listBatches: () => invoke<{ batches: BatchView[]; warning: string | null }>("list_batches"),
 
   listTranscripts: (filter: ListFilter) => invoke<TranscriptSummary[]>("list_transcripts", { filter }),
   getTranscript: (id: string) => invoke<TranscriptDetail | null>("get_transcript", { id }),

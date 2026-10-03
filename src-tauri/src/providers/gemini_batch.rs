@@ -3,7 +3,7 @@
 
 use super::check;
 use super::gemini::{base, parse_generate_response, upload_bytes};
-use super::Transcription;
+use super::{extract_usage, TokenUsage, Transcription};
 use crate::settings::ProviderConfig;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -100,6 +100,62 @@ pub fn parse_status(v: &Value) -> Status {
     }
 }
 
+/// One batch as listed by Google.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    pub name: String,
+    pub display_name: String,
+    pub model: String,
+    pub state: String,
+    pub create_time: Option<String>,
+    pub end_time: Option<String>,
+    pub request_count: Option<i64>,
+}
+
+fn find_value<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    match v {
+        Value::Object(m) => m.get(key).or_else(|| m.values().find_map(|x| find_value(x, key))),
+        Value::Array(a) => a.iter().find_map(|x| find_value(x, key)),
+        _ => None,
+    }
+}
+
+pub fn parse_listed(b: &Value) -> Listed {
+    let s = |k: &str| find_value(b, k).and_then(Value::as_str).map(str::to_string);
+    let n = |k: &str| find_value(b, k).and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+    let state = s("state").unwrap_or_default();
+    Listed {
+        name: b.get("name").and_then(Value::as_str).or_else(|| find_value(b, "name").and_then(Value::as_str)).unwrap_or_default().to_string(),
+        display_name: s("displayName").or_else(|| s("display_name")).unwrap_or_default(),
+        model: s("model").unwrap_or_default().trim_start_matches("models/").to_string(),
+        state: state.trim_start_matches("JOB_STATE_").trim_start_matches("BATCH_STATE_").to_string(),
+        create_time: s("createTime").or_else(|| s("create_time")),
+        end_time: s("endTime").or_else(|| s("end_time")),
+        request_count: n("requestCount").or_else(|| n("request_count")),
+    }
+}
+
+/// All batches for this key (newest first, up to 300).
+pub async fn list(client: &reqwest::Client, cfg: &ProviderConfig) -> Result<Vec<Listed>> {
+    let mut out = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..3 {
+        let mut url = format!("{}/v1beta/batches?pageSize=100", base(cfg));
+        if let Some(t) = &token {
+            url.push_str(&format!("&pageToken={t}"));
+        }
+        let resp = client.get(url).header("x-goog-api-key", &cfg.api_key).timeout(Duration::from_secs(60)).send().await?;
+        let v: Value = check(resp).await.context("listing batches")?.json().await?;
+        let items = v.get("batches").or_else(|| v.get("operations")).and_then(Value::as_array).cloned().unwrap_or_default();
+        out.extend(items.iter().map(parse_listed));
+        token = v.get("nextPageToken").and_then(Value::as_str).map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub async fn status(client: &reqwest::Client, cfg: &ProviderConfig, name: &str) -> Result<Status> {
     let resp = client
         .get(format!("{}/v1beta/{}", base(cfg), name))
@@ -131,8 +187,16 @@ pub async fn cancel(client: &reqwest::Client, cfg: &ProviderConfig, name: &str) 
     Ok(())
 }
 
+/// Result of one batch request: the transcription (or why there is none) and the tokens billed for it.
+#[derive(Debug)]
+pub struct ChunkResult {
+    pub result: Result<Transcription, String>,
+    /// Billed even when the request was blocked (input + thinking tokens).
+    pub usage: TokenUsage,
+}
+
 /// One result per request key: the transcription, or the error Google returned for that request.
-pub fn parse_results(lines: impl Iterator<Item = Value>) -> HashMap<String, Result<Transcription, String>> {
+pub fn parse_results(lines: impl Iterator<Item = Value>) -> HashMap<String, ChunkResult> {
     let mut out = HashMap::new();
     for line in lines {
         let key = line
@@ -141,6 +205,7 @@ pub fn parse_results(lines: impl Iterator<Item = Value>) -> HashMap<String, Resu
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let usage = line.get("response").map(extract_usage).unwrap_or_default();
         let result = match line.get("response") {
             Some(r) => parse_generate_response(r).map_err(|e| e.to_string()),
             None => Err(line
@@ -151,12 +216,12 @@ pub fn parse_results(lines: impl Iterator<Item = Value>) -> HashMap<String, Resu
                 .unwrap_or("no response for this part")
                 .to_string()),
         };
-        out.insert(key, result);
+        out.insert(key, ChunkResult { result, usage });
     }
     out
 }
 
-pub fn parse_results_file(text: &str) -> HashMap<String, Result<Transcription, String>> {
+pub fn parse_results_file(text: &str) -> HashMap<String, ChunkResult> {
     parse_results(text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()))
 }
 
@@ -184,10 +249,26 @@ mod tests {
             {"text": "[{\"start\": 1.0, \"end\": 2.5, \"speaker\": \"Speaker 1\", \"text\": \"Magandang umaga\"}]"}]}}],
             "usageMetadata": {"promptTokenCount": 15000, "candidatesTokenCount": 400}}});
         let err = json!({"key": "chunk-1", "error": {"code": 400, "message": "audio too long"}});
-        let r = parse_results_file(&format!("{ok}\n{err}\n"));
-        let t = r["chunk-0"].as_ref().unwrap();
+        let blocked = json!({"key": "chunk-2", "response": {"promptFeedback": {"blockReason": "OTHER"},
+            "usageMetadata": {"promptTokenCount": 14405, "thoughtsTokenCount": 4715}}});
+        let r = parse_results_file(&format!("{ok}\n{err}\n{blocked}\n"));
+        let t = r["chunk-0"].result.as_ref().unwrap();
         assert_eq!((t.segments[0].start, t.usage.input_tokens, t.usage.output_tokens), (1.0, 15000, 400));
-        assert_eq!(r["chunk-1"].as_ref().unwrap_err(), "audio too long");
+        assert_eq!(r["chunk-1"].result.as_ref().unwrap_err(), "audio too long");
+        assert_eq!(r["chunk-2"].result.as_ref().unwrap_err(), "blocked by Google (OTHER)");
+        assert_eq!((r["chunk-2"].usage.input_tokens, r["chunk-2"].usage.output_tokens), (14405, 4715));
+    }
+
+    #[test]
+    fn parses_listed_batches() {
+        // Shape as returned by Google's batches list (operations with metadata).
+        let b = json!({"name": "batches/abc", "metadata": {"name": "batches/abc", "displayName": "transcriber: Sep 21 Meeting",
+            "model": "models/gemini-3.8-flash", "state": "BATCH_STATE_SUCCEEDED", "createTime": "2026-10-03T06:35:00Z",
+            "endTime": "2026-10-03T06:38:48Z", "batchStats": {"requestCount": "13", "successfulRequestCount": "13"}}, "done": true});
+        let l = parse_listed(&b);
+        assert_eq!((l.name.as_str(), l.model.as_str(), l.state.as_str()), ("batches/abc", "gemini-3.8-flash", "SUCCEEDED"));
+        assert_eq!(l.request_count, Some(13));
+        assert_eq!(l.display_name, "transcriber: Sep 21 Meeting");
     }
 
     #[test]
@@ -216,7 +297,7 @@ mod tests {
         assert_eq!(s.state, State::Succeeded);
         let results = parse_results_file(&download(&client, &cfg, s.results_file.as_deref().unwrap()).await.unwrap());
         assert_eq!(results.len(), 2);
-        assert_eq!(results["chunk-1"].as_ref().unwrap().segments[0].text, "text of chunk-1");
+        assert_eq!(results["chunk-1"].result.as_ref().unwrap().segments[0].text, "text of chunk-1");
         cancel(&client, &cfg, &name).await.unwrap();
         println!("batch flow ok: {name}");
     }

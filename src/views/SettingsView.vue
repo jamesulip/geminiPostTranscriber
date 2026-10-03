@@ -180,6 +180,16 @@ async function save() {
               <Label>Chunk length — overnight (min)</Label>
               <Input v-model.number="form.batch_chunk_minutes" type="number" min="1" max="30" />
             </div>
+            <div class="col-span-2 flex items-start justify-between gap-4 rounded-lg border p-3">
+              <div class="grid gap-0.5">
+                <Label for="batch-retry">Re-do failed overnight parts automatically</Label>
+                <p class="text-muted-foreground text-xs">
+                  When Google blocks or skips part of a batch, transcribe just that part right away with the
+                  speaker-label provider (Gemini 3.5 Transcribe). Off: the parts are flagged for “Fix problems”.
+                </p>
+              </div>
+              <Switch id="batch-retry" v-model="form.batch_retry_failed" />
+            </div>
             <div />
             <div class="grid gap-1.5">
               <Label>Speed — text only (1.0–2.0)</Label>

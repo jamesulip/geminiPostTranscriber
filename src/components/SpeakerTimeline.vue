@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { Pause } from "@lucide/vue";
+import { AlertTriangle, Pause } from "@lucide/vue";
 import type { SegmentRow } from "@/lib/api";
 import { formatTime, speakerColor } from "@/lib/format";
-import { findGaps, formatGap, TimelineScale } from "@/lib/breaks";
+import { findGaps, formatGap, gapKey, TimelineScale } from "@/lib/breaks";
 
 const props = defineProps<{
   segments: SegmentRow[];
@@ -14,6 +14,8 @@ const props = defineProps<{
   matches: Set<number>;
   /** Shrink long stretches without speech to a small marker. */
   collapse: boolean;
+  /** Gaps (by `gapKey`) whose audio has speech: skipped text, not a pause. Never collapsed. */
+  missing: Set<number>;
 }>();
 const emit = defineEmits<{ seek: [time: number] }>();
 
@@ -23,7 +25,8 @@ const lanes = computed(() => {
 });
 const total = computed(() => Math.max(props.duration, props.segments.at(-1)?.end ?? 0, 1));
 const gaps = computed(() => findGaps(props.segments, total.value));
-const scale = computed(() => new TimelineScale(total.value, props.collapse ? gaps.value : []));
+const pauses = computed(() => gaps.value.filter((g) => !props.missing.has(gapKey(g))));
+const scale = computed(() => new TimelineScale(total.value, props.collapse ? pauses.value : []));
 const pct = (t: number) => `${scale.value.pos(t) * 100}%`;
 const span = (a: number, b: number) => `${(scale.value.pos(b) - scale.value.pos(a)) * 100}%`;
 
@@ -98,10 +101,22 @@ function timeAt(e: MouseEvent) {
           v-for="g in gaps"
           :key="g.start"
           class="pointer-events-none absolute top-0 bottom-0 flex items-center justify-center overflow-hidden"
-          :class="collapse ? 'break-stripes border-x border-dashed border-slate-300 dark:border-slate-600' : ''"
+          :class="
+            missing.has(gapKey(g))
+              ? 'border-x border-dashed border-amber-500/60 bg-amber-500/10'
+              : collapse
+                ? 'break-stripes border-x border-dashed border-slate-300 dark:border-slate-600'
+                : ''
+          "
           :style="{ left: pct(g.start), width: span(g.start, g.end) }"
         >
           <span
+            v-if="missing.has(gapKey(g))"
+            class="bg-background/80 flex items-center gap-0.5 rounded px-1 text-[10px] whitespace-nowrap text-amber-700 tabular-nums dark:text-amber-500"
+            :title="`Speech in the audio but no text for ${formatGap(g.end - g.start)}`"
+          ><AlertTriangle class="size-2.5" />{{ formatGap(g.end - g.start) }}</span>
+          <span
+            v-else
             class="text-muted-foreground bg-background/80 flex items-center gap-0.5 rounded px-1 text-[10px] whitespace-nowrap tabular-nums"
             :title="`No speech for ${formatGap(g.end - g.start)}`"
           ><Pause class="size-2.5" />{{ formatGap(g.end - g.start) }}</span>

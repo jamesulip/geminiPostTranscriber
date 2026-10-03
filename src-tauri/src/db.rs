@@ -108,6 +108,22 @@ CREATE TABLE IF NOT EXISTS transcript_versions (
   UNIQUE (transcript_id, number)
 );
 
+-- Overnight batches sent to Google (kept after they finish, for the Batches page).
+CREATE TABLE IF NOT EXISTS batches (
+  name TEXT PRIMARY KEY,
+  transcript_id TEXT,
+  title TEXT NOT NULL,
+  model TEXT NOT NULL,
+  submitted_at TEXT NOT NULL,
+  parts INTEGER NOT NULL,
+  finished_at TEXT,
+  ok_parts INTEGER,
+  failed_parts INTEGER,
+  retried INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL,
+  outcome TEXT
+);
+
 -- One row per transcription job (kept when the transcript is deleted).
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY,
@@ -274,6 +290,79 @@ pub fn set_recording_meta(c: &Connection, id: &str, recorded_at: Option<&str>, d
 pub fn set_batch(c: &Connection, id: &str, batch: Option<&str>) -> Result<()> {
     c.execute("UPDATE transcripts SET batch = ?2 WHERE id = ?1", params![id, batch])?;
     Ok(())
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct BatchRecord {
+    pub name: String,
+    pub transcript_id: Option<String>,
+    pub title: String,
+    pub model: String,
+    pub submitted_at: String,
+    pub parts: i64,
+    pub finished_at: Option<String>,
+    pub ok_parts: Option<i64>,
+    pub failed_parts: Option<i64>,
+    pub retried: bool,
+    pub cost_usd: Option<f64>,
+    /// "done", "error: …", "cancelled" once finished.
+    pub outcome: Option<String>,
+}
+
+pub fn insert_batch(c: &Connection, name: &str, transcript_id: &str, title: &str, model: &str, submitted_at: &str, parts: i64) -> Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO batches (name, transcript_id, title, model, submitted_at, parts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, transcript_id, title, model, submitted_at, parts],
+    )?;
+    Ok(())
+}
+
+pub struct BatchOutcome<'a> {
+    pub ok_parts: Option<i64>,
+    pub failed_parts: Option<i64>,
+    pub retried: bool,
+    pub cost_usd: Option<f64>,
+    pub outcome: &'a str,
+}
+
+pub fn finish_batch(c: &Connection, name: &str, o: &BatchOutcome) -> Result<()> {
+    c.execute(
+        "UPDATE batches SET finished_at = ?2, ok_parts = COALESCE(?3, ok_parts), failed_parts = COALESCE(?4, failed_parts),
+           retried = ?5, cost_usd = COALESCE(?6, cost_usd), outcome = ?7 WHERE name = ?1",
+        params![name, chrono::Local::now().to_rfc3339(), o.ok_parts, o.failed_parts, o.retried, o.cost_usd, o.outcome],
+    )?;
+    Ok(())
+}
+
+pub fn list_batches(c: &Connection) -> Result<Vec<BatchRecord>> {
+    let mut st = c.prepare(
+        "SELECT b.name, b.transcript_id, COALESCE(t.title, b.title), b.model, b.submitted_at, b.parts, b.finished_at,
+                b.ok_parts, b.failed_parts, b.retried, b.cost_usd, b.outcome
+         FROM batches b LEFT JOIN transcripts t ON t.id = b.transcript_id ORDER BY b.submitted_at DESC",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(BatchRecord {
+            name: r.get(0)?,
+            transcript_id: r.get(1)?,
+            title: r.get(2)?,
+            model: r.get(3)?,
+            submitted_at: r.get(4)?,
+            parts: r.get(5)?,
+            finished_at: r.get(6)?,
+            ok_parts: r.get(7)?,
+            failed_parts: r.get(8)?,
+            retried: r.get(9)?,
+            cost_usd: r.get(10)?,
+            outcome: r.get(11)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Transcript id for a title (used to link batches sent before they were recorded locally).
+pub fn transcript_id_by_title(c: &Connection, title: &str) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT id FROM transcripts WHERE title = ?1 ORDER BY created_at DESC LIMIT 1", [title], |r| r.get(0))
+        .optional()?)
 }
 
 /// Transcripts waiting for a Google batch: (id, batch JSON).

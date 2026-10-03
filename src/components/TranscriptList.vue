@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from "vue";
 import { useVirtualizer } from "@tanstack/vue-virtual";
-import { PauseCircle } from "@lucide/vue";
+import { AlertTriangle, PauseCircle } from "@lucide/vue";
 import SegmentItem from "@/components/SegmentItem.vue";
 import type { SegmentRow } from "@/lib/api";
 import { formatTime, speakerColor } from "@/lib/format";
-import { BREAK_SECONDS, findGaps, formatGap, type Gap } from "@/lib/breaks";
+import { BREAK_SECONDS, findGaps, formatGap, gapKey, type Gap } from "@/lib/breaks";
 
 // The transcript rows, virtualized: only rows in (or near) the viewport are mounted, so
 // transcripts with thousands of segments open instantly and stay smooth during playback.
@@ -16,6 +16,8 @@ const props = defineProps<{
   breaks: boolean;
   /** Length used for pause markers: not-yet-transcribed audio isn't a "break". */
   duration: number;
+  /** Gaps (by `gapKey`) whose audio has speech: skipped text, not a pause. */
+  missing: Set<number>;
   activeId: number | null;
   /** Highlight query, applied to the segments in `matches`. */
   query: string;
@@ -86,7 +88,21 @@ defineExpose({ scrollToSegment });
           :ref="(el) => virtualizer.measureElement(el as Element | null)"
           :data-index="item.index"
         >
-          <div v-if="row.kind === 'break'" class="text-muted-foreground flex items-center gap-3 px-2 py-2 text-xs">
+          <div
+            v-if="row.kind === 'break' && missing.has(gapKey(row.gap))"
+            class="flex items-center gap-3 px-2 py-2 text-xs text-amber-700 dark:text-amber-500"
+          >
+            <span class="h-px flex-1 border-t border-dashed border-current" />
+            <button
+              class="flex items-center gap-1 tabular-nums hover:underline"
+              title="There's speech here but no text. Use Fix problems to transcribe it."
+              @click="emit('seek', row.gap.start)"
+            >
+              <AlertTriangle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} not transcribed · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}
+            </button>
+            <span class="h-px flex-1 border-t border-dashed border-current" />
+          </div>
+          <div v-else-if="row.kind === 'break'" class="text-muted-foreground flex items-center gap-3 px-2 py-2 text-xs">
             <span class="h-px flex-1 border-t border-dashed" />
             <button class="hover:text-primary flex items-center gap-1 tabular-nums" title="Jump to the end of the pause" @click="emit('seek', row.gap.end)">
               <PauseCircle class="size-3.5" /> {{ formatGap(row.gap.end - row.gap.start) }} pause · {{ formatTime(row.gap.start) }} – {{ formatTime(row.gap.end) }}

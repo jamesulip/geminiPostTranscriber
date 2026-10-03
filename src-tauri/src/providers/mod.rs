@@ -98,7 +98,9 @@ pub fn extract_usage(v: &serde_json::Value) -> TokenUsage {
         let other = get(&["total_thought_tokens", "thoughtsTokenCount"]) + get(&["total_cached_tokens", "cachedContentTokenCount"]);
         output = total.saturating_sub(input + other);
     }
-    TokenUsage { input_tokens: input, output_tokens: output }
+    // Thinking ("thought") tokens are billed at the output rate but reported separately.
+    let thoughts = get(&["total_thought_tokens", "thoughtsTokenCount", "thoughts_token_count"]);
+    TokenUsage { input_tokens: input, output_tokens: output + thoughts }
 }
 
 pub struct Request<'a> {
@@ -385,7 +387,13 @@ mod tests {
             "output_tokens_by_modality": [{"modality": "text", "tokens": 175}]}}));
         assert_eq!(by_mod, TokenUsage { input_tokens: 1500, output_tokens: 175 });
         let total = extract_usage(&json!({"usage": {"total_input_tokens": 1500, "total_tokens": 1700, "total_thought_tokens": 25}}));
-        assert_eq!(total.output_tokens, 175);
+        assert_eq!(total.output_tokens, 200, "175 text + 25 thinking");
+        // generateContent: candidates + thoughts both count as output.
+        let g = extract_usage(&json!({"usageMetadata": {"promptTokenCount": 14797, "candidatesTokenCount": 9804, "thoughtsTokenCount": 4784}}));
+        assert_eq!((g.input_tokens, g.output_tokens), (14797, 9804 + 4784));
+        // Blocked response: input + thinking still billed, no text.
+        let b = extract_usage(&json!({"promptFeedback": {"blockReason": "OTHER"}, "usageMetadata": {"promptTokenCount": 14405, "thoughtsTokenCount": 4715}}));
+        assert_eq!((b.input_tokens, b.output_tokens), (14405, 4715));
     }
 
     #[test]

@@ -73,7 +73,7 @@ fn spawn_job(
     spawn_job_with(app, state, id, source, audio_path, opts, None)
 }
 
-fn spawn_job_with(
+pub(crate) fn spawn_job_with(
     app: &AppHandle,
     state: &AppState,
     id: String,
@@ -172,6 +172,23 @@ fn retranscribe(app: AppHandle, state: State<AppState>, id: String, options: job
     spawn_job(&app, &state, id, None, audio_path, options)
 }
 
+/// Seconds of speech (VAD on the original audio) inside each `[start, end]` stretch, so the UI
+/// can tell real pauses from audio the model skipped.
+#[tauri::command]
+async fn speech_in_gaps(state: State<'_, AppState>, id: String, gaps: Vec<(f64, f64)>) -> CmdResult<Vec<f64>> {
+    let audio_path = {
+        let db = state.db.lock().unwrap();
+        PathBuf::from(db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?.audio_path)
+    };
+    std::fs::create_dir_all(&state.cache_dir).map_err(err)?;
+    let scratch = state.cache_dir.join(format!("gaps-{}.wav", uuid::Uuid::new_v4()));
+    let mut out = Vec::with_capacity(gaps.len());
+    for (a, b) in gaps {
+        out.push(audio::speech_seconds(&audio_path, a, (b - a).max(0.0), &scratch).await.map_err(err)?);
+    }
+    Ok(out)
+}
+
 /// Stretches of the current version that look wrong (missing text, loops, impossible timings,
 /// missing speaker labels), for re-transcribing only those parts.
 #[tauri::command]
@@ -243,6 +260,19 @@ fn cancel_job(app: AppHandle, state: State<AppState>, id: String) {
             }
         });
     }
+}
+
+#[derive(serde::Serialize)]
+struct BatchList {
+    batches: Vec<batch::BatchView>,
+    warning: Option<String>,
+}
+
+/// All overnight batches (Google's list merged with local records) for the Batches page.
+#[tauri::command]
+async fn list_batches(app: AppHandle) -> CmdResult<BatchList> {
+    let (batches, warning) = batch::list(&app).await.map_err(err)?;
+    Ok(BatchList { batches, warning })
 }
 
 /// Check overnight batches at Google right away (instead of waiting for the next round).
@@ -443,10 +473,12 @@ pub fn run() {
             start_transcription,
             retranscribe,
             find_problems,
+            speech_in_gaps,
             repair_transcript,
             cancel_job,
             job_progress,
             check_batches,
+            list_batches,
             list_transcripts,
             get_transcript,
             update_transcript,

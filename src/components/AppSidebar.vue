@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import {
-  AudioLines, ChartColumn, ChevronRight, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
+  AudioLines, ChartColumn, ChevronRight, Moon, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -23,6 +23,8 @@ const jobs = useJobs();
 const router = useRouter();
 const route = useRoute();
 const collapsed = ref<Set<number>>(new Set());
+/** Meetings waiting at Google as overnight batches (badge on "Batches"). */
+const waitingBatches = computed(() => library.transcripts.filter((t) => t.status === "queued").length);
 
 type Prompt = { title: string; initial?: string; submit: (v: string) => Promise<unknown> };
 const prompt = ref<Prompt | null>(null);
@@ -166,6 +168,17 @@ async function upload() {
     </ScrollArea>
 
     <div class="border-sidebar-border flex flex-col gap-0.5 border-t p-3">
+      <Button
+        variant="ghost"
+        class="w-full justify-start"
+        :class="route.name === 'batches' && 'bg-sidebar-accent'"
+        @click="router.push({ name: 'batches' })"
+      >
+        <Moon /> Batches
+        <span v-if="waitingBatches" class="bg-primary text-primary-foreground ml-auto rounded-full px-1.5 text-[10px]">
+          {{ waitingBatches }}
+        </span>
+      </Button>
       <Button
         variant="ghost"
         class="w-full justify-start"

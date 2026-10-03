@@ -21,6 +21,14 @@ export function findGaps(segments: SegmentRow[], duration: number, min = BREAK_S
   return gaps;
 }
 
+/** A gap with this much speech in the audio is text the model skipped, not a pause. */
+export function isMissing(gap: Gap, speech: number): boolean {
+  return speech >= Math.max(20, 0.25 * (gap.end - gap.start));
+}
+
+/** Key for looking up per-gap results (start time, rounded). */
+export const gapKey = (g: Gap) => Math.round(g.start);
+
 export function formatGap(seconds: number): string {
   const s = Math.round(seconds);
   const h = Math.floor(s / 3600);

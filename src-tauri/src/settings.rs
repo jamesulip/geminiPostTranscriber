@@ -119,6 +119,9 @@ pub struct Settings {
     pub batch_model: String,
     /// Chunk length for batch jobs.
     pub batch_chunk_minutes: f64,
+    /// Re-do batch parts that Google blocked or returned empty, right away with the
+    /// speaker-label provider (Gemini 3.5 Transcribe).
+    pub batch_retry_failed: bool,
 }
 
 impl Default for Settings {
@@ -174,6 +177,7 @@ impl Default for Settings {
             gemini_chunk_minutes: 10.0,
             batch_model: "gemini-3.8-flash".into(),
             batch_chunk_minutes: 10.0,
+            batch_retry_failed: true,
         }
     }
 }

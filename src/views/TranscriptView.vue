@@ -30,6 +30,7 @@ import {
 } from "@/lib/api";
 import { formatDate, formatDuration, formatLanguage, formatTime, formatUsd, speakerColor } from "@/lib/format";
 import { defaultOptions, normalizeOptions } from "@/lib/options";
+import { findGaps, gapKey, isMissing } from "@/lib/breaks";
 import { useJobs } from "@/stores/jobs";
 import { useLibrary } from "@/stores/library";
 import { useSettings } from "@/stores/settings";
@@ -147,6 +148,25 @@ const segments = computed<SegmentRow[]>(
 const readOnly = computed(() => !!viewing.value || showingPartial.value);
 /** Length used for the timeline and pause markers: not-yet-transcribed audio isn't a "break". */
 const shownDuration = computed(() => (showingPartial.value ? partialUntil.value : duration.value));
+
+/** Gaps (by `gapKey`) where the audio has speech but there's no text: skipped, not a pause. */
+const missingGaps = ref(new Set<number>());
+watch(
+  [id, segments, shownDuration],
+  async ([tid, segs, dur]) => {
+    missingGaps.value = new Set();
+    const gaps = findGaps(segs, dur);
+    if (!tid || !gaps.length) return;
+    try {
+      const speech = await api.speechInGaps(tid, gaps.map((g) => [g.start, g.end]));
+      if (tid !== id.value || segs !== segments.value) return; // stale
+      missingGaps.value = new Set(gaps.filter((g, i) => isMissing(g, speech[i])).map(gapKey));
+    } catch (e) {
+      console.warn("speech check failed", e);
+    }
+  },
+  { immediate: true },
+);
 
 const speakerOrder = computed(() => {
   const order: string[] = [];
@@ -493,6 +513,7 @@ const saved = computed(() =>
         v-if="segments.length"
         :segments="segments"
         :collapse="collapseBreaks"
+        :missing="missingGaps"
         :duration="shownDuration"
         :current-time="currentTime"
         :speaker-order="speakerOrder"
@@ -585,6 +606,7 @@ const saved = computed(() =>
         ref="list"
         :segments="shown"
         :breaks="!filtering"
+        :missing="missingGaps"
         :duration="shownDuration"
         :active-id="activeId"
         :query="find"

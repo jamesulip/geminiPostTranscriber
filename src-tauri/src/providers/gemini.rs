@@ -317,7 +317,14 @@ pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speaker
 
 /// Segments + usage from a `generateContent` response (or a batch result line's `response`).
 pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
-    let candidate = v.get("candidates").and_then(|c| c.get(0)).ok_or_else(|| anyhow!("Gemini returned no result"))?;
+    let Some(candidate) = v.get("candidates").and_then(|c| c.get(0)) else {
+        let feedback = v.get("promptFeedback").or_else(|| v.get("prompt_feedback"));
+        let reason = feedback.and_then(|f| f.get("blockReason").or_else(|| f.get("block_reason"))).and_then(Value::as_str);
+        match reason {
+            Some(r) => bail!("blocked by Google ({r})"),
+            None => bail!("Gemini returned no result"),
+        }
+    };
     let text: String = candidate["content"]["parts"]
         .as_array()
         .map(|parts| parts.iter().filter_map(|p| p["text"].as_str()).collect())
