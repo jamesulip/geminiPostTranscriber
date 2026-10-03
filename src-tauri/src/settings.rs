@@ -37,6 +37,8 @@ pub fn known_token_price(model: &str) -> Option<(f64, f64)> {
         ("gemini-3.5-transcribe", (2.0, 12.0)),
         ("gemini-3.8-flash-lite", (0.50, 2.50)),
         ("gemini-3.8-flash", (0.75, 3.75)),
+        // Blocked parts fall back to this one. Google lists $1.50 / $9.00 for text input; audio may cost more.
+        ("gemini-3.5-flash", (1.50, 9.00)),
         ("gemini-3.1-flash-lite", (0.50, 1.50)),
     ];
     table.iter().find(|(k, _)| m.contains(k)).map(|(_, p)| *p)
@@ -119,8 +121,8 @@ pub struct Settings {
     pub batch_model: String,
     /// Chunk length for batch jobs.
     pub batch_chunk_minutes: f64,
-    /// Re-do batch parts that Google blocked or returned empty, right away with the
-    /// speaker-label provider (Gemini 3.5 Transcribe).
+    /// Re-do batch parts that Google blocked or returned empty, right away with Gemini 3.5 Flash
+    /// (3.5 Transcribe if that's blocked too).
     pub batch_retry_failed: bool,
 }
 

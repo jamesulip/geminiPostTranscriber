@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
@@ -22,6 +22,7 @@ watch(
   (id, old) => {
     // Overnight mode sets its own provider/model/chunking (see setWhen).
     if (!old || id === old || opts.value.batch) return;
+    customModel.value = false;
     const p = props.settings.providers.find((x) => x.id === id);
     opts.value.model = p?.model ?? null;
     Object.assign(opts.value, providerDefaults(props.settings, p));
@@ -67,6 +68,26 @@ function setWhen(batch: boolean) {
   const base = defaultOptions(props.settings);
   opts.value = { ...(batch ? batchOptions(props.settings, base) : base), ...keep };
 }
+
+/** Gemini models offered in the picker; anything else is typed in under "Other". */
+const GEMINI_MODELS = [
+  { id: "gemini-3.5-transcribe", label: "Gemini 3.5 Transcribe", hint: "Speech model: best timings and speaker labels. Never blocked so far." },
+  { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", hint: "About ⅓ the cost. Timings and speakers come from the prompt (less precise). Parts Google's filter blocks are re-done with Gemini 3.5 Flash, or 3.5 Transcribe if that's blocked too." },
+];
+const OTHER = "__other__";
+const isGemini = computed(() => provider.value?.kind === "gemini");
+const customModel = ref(false);
+const geminiModel = computed({
+  get: () => {
+    const m = opts.value.model?.trim() || provider.value?.model;
+    return customModel.value || !GEMINI_MODELS.some((x) => x.id === m) ? OTHER : m!;
+  },
+  set: (v: string) => {
+    customModel.value = v === OTHER;
+    if (v !== OTHER) opts.value.model = v;
+  },
+});
+const geminiHint = computed(() => GEMINI_MODELS.find((x) => x.id === geminiModel.value)?.hint);
 
 const providerName = (id: string) => props.settings.providers.find((p) => p.id === id)?.name ?? id;
 const missingKey = computed(() => provider.value && !provider.value.api_key.trim());
@@ -127,9 +148,21 @@ const missingKey = computed(() => provider.value && !provider.value.api_key.trim
       </div>
       <div class="grid gap-1.5">
         <Label>Model</Label>
-        <Input v-model="opts.model as string" :placeholder="provider?.model" />
+        <Select v-if="isGemini && !opts.batch" v-model="geminiModel">
+          <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem v-for="m in GEMINI_MODELS" :key="m.id" :value="m.id">{{ m.label }}</SelectItem>
+            <SelectItem :value="OTHER">Other…</SelectItem>
+          </SelectContent>
+        </Select>
+        <Input
+          v-if="!isGemini || opts.batch || geminiModel === OTHER"
+          v-model="opts.model as string"
+          :placeholder="provider?.model"
+        />
       </div>
     </div>
+    <p v-if="isGemini && !opts.batch && geminiHint" class="text-muted-foreground -mt-2 text-xs">{{ geminiHint }}</p>
     <p v-if="missingKey" class="text-destructive -mt-2 text-xs">No API key for {{ provider?.name }} — add one in Settings.</p>
 
     <div class="grid grid-cols-2 gap-3">

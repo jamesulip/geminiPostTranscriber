@@ -184,8 +184,8 @@ async function save() {
               <div class="grid gap-0.5">
                 <Label for="batch-retry">Re-do failed overnight parts automatically</Label>
                 <p class="text-muted-foreground text-xs">
-                  When Google blocks or skips part of a batch, transcribe just that part right away with the
-                  speaker-label provider (Gemini 3.5 Transcribe). Off: the parts are flagged for “Fix problems”.
+                  When Google blocks or skips part of a batch, transcribe just that part right away with
+                  Gemini 3.5 Flash, or 3.5 Transcribe if that's blocked too. Off: the parts are flagged for “Fix problems”.
                 </p>
               </div>
               <Switch id="batch-retry" v-model="form.batch_retry_failed" />

@@ -33,7 +33,7 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
     let resp = client.post(url).bearer_auth(&cfg.api_key).multipart(form).send().await?;
     let body: Value = check(resp).await.context("transcribing")?.json().await.context("invalid JSON from provider")?;
-    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body), language: extract_language(&body), raw: Some(body) })
+    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body), language: extract_language(&body), raw: Some(body), fallback: None })
 }
 
 /// Whisper-style APIs only accept ISO 639-1 codes ("tl", "en"); Gemini accepts others ("fil").

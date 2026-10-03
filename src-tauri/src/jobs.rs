@@ -83,19 +83,50 @@ pub struct Meter {
     language: Option<String>,
     /// original / processed duration, to attribute original minutes to sent chunks.
     ratio: f64,
-    sent_seconds: f64,
+    /// Sent to the job's model.
+    main: Sent,
+    /// Parts Google blocked, re-done with another model (billed at that model's rates).
+    fallback: std::collections::BTreeMap<String, Sent>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Sent {
+    seconds: f64,
     requests: i64,
     tokens: TokenUsage,
 }
 
-impl Meter {
-    fn add(&mut self, seconds: f64, tokens: TokenUsage, language: Option<String>) {
-        if self.language.is_none() {
-            self.language = language;
-        }
-        self.sent_seconds += seconds;
+impl Sent {
+    fn add(&mut self, seconds: f64, tokens: TokenUsage) {
+        self.seconds += seconds;
         self.requests += 1;
         self.tokens += tokens;
+    }
+}
+
+impl Meter {
+    /// Count one transcribed chunk; `job_model` is the model the job asked for.
+    fn add(&mut self, job_model: &str, seconds: f64, t: &Transcription) {
+        if self.language.is_none() {
+            self.language = t.language.clone();
+        }
+        let Some(f) = &t.fallback else {
+            self.main.add(seconds, t.usage);
+            return;
+        };
+        // Blocked attempts are billed too, but their audio isn't counted twice.
+        for (model, usage) in &f.blocked {
+            self.sent_to(job_model, model).add(0.0, *usage);
+        }
+        self.sent_to(job_model, &f.model).add(seconds, t.usage);
+    }
+
+    fn sent_to(&mut self, job_model: &str, model: &str) -> &mut Sent {
+        if model == job_model {
+            &mut self.main
+        } else {
+            self.fallback.entry(model.to_string()).or_default()
+        }
     }
 }
 
@@ -205,34 +236,44 @@ pub async fn run(app: AppHandle, job: Job) {
             Some(e) => db::mark_failed(&db, &job.id, e),
             None => db::set_status(&db, &job.id, "done", None),
         };
-        // Record whatever was billed, including partial work from failed/cancelled jobs.
+        // Record whatever was billed, including partial work from failed/cancelled jobs: one row
+        // for the job's model, one per fallback model (the provider's custom prices are for its own model).
         let m = meter.lock().unwrap();
-        if m.requests > 0 {
-            let title: String = db
-                .query_row("SELECT title FROM transcripts WHERE id = ?1", [&job.id], |r| r.get(0))
-                .unwrap_or_default();
-            let original = m.sent_seconds * m.ratio;
-            let (input, output) = (m.tokens.input_tokens as i64, m.tokens.output_tokens as i64);
+        let rows = std::iter::once((job.provider.clone(), m.main)).chain(m.fallback.iter().map(|(model, sent)| {
+            let cfg = ProviderConfig {
+                model: model.clone(),
+                price_per_minute: None,
+                price_input_per_mtok: None,
+                price_output_per_mtok: None,
+                ..job.provider.clone()
+            };
+            (cfg, *sent)
+        }));
+        let title: String =
+            db.query_row("SELECT title FROM transcripts WHERE id = ?1", [&job.id], |r| r.get(0)).unwrap_or_default();
+        for (cfg, sent) in rows.filter(|(_, s)| s.requests > 0) {
+            let original = sent.seconds * m.ratio;
+            let (input, output) = (sent.tokens.input_tokens as i64, sent.tokens.output_tokens as i64);
             // Prefer actual token counts when the provider reports them and we know its token prices.
-            let (cost_usd, saved_usd) = match job.provider.token_price() {
-                Some(p) if input > 0 => db::token_cost(input, output, p, original, m.sent_seconds),
-                _ => db::minute_cost(original, m.sent_seconds, job.provider.effective_price()),
+            let (cost_usd, saved_usd) = match cfg.token_price() {
+                Some(p) if input > 0 => db::token_cost(input, output, p, original, sent.seconds),
+                _ => db::minute_cost(original, sent.seconds, cfg.effective_price()),
             };
             let _ = db::insert_usage(
                 &db,
                 &db::NewUsage {
                     transcript_id: &job.id,
                     title: &title,
-                    provider: &job.provider.id,
-                    provider_name: &job.provider.name,
-                    model: &job.provider.model,
+                    provider: &cfg.id,
+                    provider_name: &cfg.name,
+                    model: &cfg.model,
                     status,
                     original_seconds: original,
-                    sent_seconds: m.sent_seconds,
-                    requests: m.requests,
+                    sent_seconds: sent.seconds,
+                    requests: sent.requests,
                     input_tokens: input,
                     output_tokens: output,
-                    price_per_minute: job.provider.effective_price(),
+                    price_per_minute: cfg.effective_price(),
                     cost_usd,
                     saved_usd,
                 },
@@ -621,18 +662,23 @@ pub fn transcribe_checked<'a>(
             cancel: ctx.cancel,
         };
         let mut t = providers::transcribe(ctx.client, ctx.cfg, &req).await?;
-        ctx.meter.lock().unwrap().add(chunk.duration, t.usage, t.language.clone());
+        ctx.meter.lock().unwrap().add(&ctx.cfg.model, chunk.duration, &t);
         if let Some(raw) = t.raw.take() {
             let _ = std::fs::write(ctx.raw_dir.join(format!("chunk-{label}.json")), raw.to_string());
         }
+        let mut notes = Vec::new();
+        if let Some(f) = &t.fallback {
+            notes.push(format!("Part {label} ({}): blocked by Google on {} — transcribed with {} instead", span(&chunk), f.blocked_models(), f.model));
+        }
         let Some(problem) = quality::check(&t.segments, chunk.duration, &ctx.checks) else {
             t.segments = quality::remove_loops(t.segments).0;
-            return Ok((t, Vec::new()));
+            return Ok((t, notes));
         };
         if depth >= MAX_SPLIT_DEPTH || chunk.duration < MIN_SPLIT_SECS {
             // Keep what we have, minus loops, and tell the user this part may be incomplete.
             t.segments = quality::remove_loops(t.segments).0;
-            return Ok((t, vec![format!("Part {label} ({}): {problem}", span(&chunk))]));
+            notes.push(format!("Part {label} ({}): {problem}", span(&chunk)));
+            return Ok((t, notes));
         }
 
         on_retry(format!("Chunk {label}: {problem} — re-transcribing it in two halves"));
@@ -658,7 +704,7 @@ pub fn transcribe_checked<'a>(
         segments.extend(tb.segments.into_iter().map(|s| Segment { start: s.start + shift, end: s.end + shift, ..s }));
         let mut usage = ta.usage;
         usage += tb.usage;
-        Ok((Transcription { segments, usage, language: ta.language.or(tb.language), raw: None }, notes))
+        Ok((Transcription { segments, usage, language: ta.language.or(tb.language), raw: None, fallback: None }, notes))
     }
     .boxed()
 }
@@ -709,6 +755,24 @@ pub fn chunk_minutes_default(kind: &ProviderKind, s: &crate::settings::Settings)
 mod tests {
     use super::*;
     use crate::settings::ProviderKind;
+
+    #[test]
+    fn meter_bills_blocked_attempts_and_fallbacks_separately() {
+        let t = |fallback: Option<providers::Fallback>| Transcription {
+            segments: vec![], usage: TokenUsage { input_tokens: 100, output_tokens: 10 }, language: None, raw: None, fallback,
+        };
+        let mut m = Meter::default();
+        m.add("gemini-3.8-flash", 600.0, &t(None));
+        let usage = |n| TokenUsage { input_tokens: n, output_tokens: 5 };
+        let blocked = vec![("gemini-3.8-flash".to_string(), usage(90)), ("gemini-3.5-flash".to_string(), usage(80))];
+        m.add("gemini-3.8-flash", 300.0, &t(Some(providers::Fallback { model: "gemini-3.5-transcribe".into(), blocked })));
+        // Each blocked attempt counts as a request on its own model, without its audio.
+        assert_eq!((m.main.seconds, m.main.requests, m.main.tokens.input_tokens), (600.0, 2, 190));
+        let flash = m.fallback["gemini-3.5-flash"];
+        assert_eq!((flash.seconds, flash.requests, flash.tokens.input_tokens), (0.0, 1, 80));
+        let last = m.fallback["gemini-3.5-transcribe"];
+        assert_eq!((last.seconds, last.requests, last.tokens.input_tokens), (300.0, 1, 100));
+    }
 
     #[test]
     fn partial_json_maps_only_finished_chunks() {
@@ -771,7 +835,7 @@ mod tests {
             for n in notes { println!("note: {n}"); }
             per_chunk.push(t.segments);
         }
-        println!("requests {}", meter.lock().unwrap().requests);
+        println!("requests {}", meter.lock().unwrap().main.requests);
         let merged = merge(&prepared.chunks, per_chunk, &prepared.map);
         println!("orig {:.2}s processed {:.2}s chunks {}", prepared.original_duration, prepared.processed_duration, prepared.chunks.len());
         for s in &merged { println!("{:7.2} {:7.2} {}", s.start, s.end, s.text); }

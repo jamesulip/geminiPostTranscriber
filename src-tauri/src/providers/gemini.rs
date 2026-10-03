@@ -1,8 +1,8 @@
 //! Gemini. `*-transcribe` models use the Interactions API (native diarization and word
 //! timestamps); other models fall back to `generateContent` with a JSON schema.
 
-use super::{check, extract_language, extract_usage, parse_time, Request, Segment, Transcription};
-use crate::settings::ProviderConfig;
+use super::{check, extract_language, extract_usage, parse_time, Request, Segment, TokenUsage, Transcription};
+use crate::settings::{ProviderConfig, ProviderKind};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -156,7 +156,7 @@ async fn interact(
             .await?;
         v = check(r).await?.json().await?;
     }
-    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v), raw: Some(v) })
+    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v), raw: Some(v), fallback: None })
 }
 
 #[derive(Debug)]
@@ -315,13 +315,46 @@ pub fn transcription_request(audio: &[u8], language: Option<&str>, known_speaker
     })
 }
 
+/// Re-does parts Google blocks on another general model. Google says only "OTHER", and its
+/// filter tripped on ordinary meeting audio with 3.7 and 3.8 Flash where 3.5 Flash didn't.
+pub const BLOCK_FALLBACK_MODEL: &str = "gemini-3.5-flash";
+/// Re-does parts 3.5 Flash blocks too. The speech model hasn't blocked anything so far.
+pub const LAST_RESORT_MODEL: &str = "gemini-3.5-transcribe";
+
+/// The model to re-do a blocked part with, if any.
+pub fn block_fallback(cfg: &ProviderConfig) -> Option<&'static str> {
+    if cfg.kind != ProviderKind::Gemini || cfg.model.contains("transcribe") {
+        return None;
+    }
+    Some(if cfg.model == BLOCK_FALLBACK_MODEL { LAST_RESORT_MODEL } else { BLOCK_FALLBACK_MODEL })
+}
+
+/// Google refused to transcribe the audio. The request is billed anyway (input + thinking).
+#[derive(Debug)]
+pub struct Blocked {
+    pub reason: String,
+    pub usage: TokenUsage,
+}
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "blocked by Google ({})", self.reason)
+    }
+}
+
+impl std::error::Error for Blocked {}
+
+/// Finish reasons that mean Google withheld the answer rather than the audio having no speech.
+const BLOCK_FINISH_REASONS: &[&str] = &["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"];
+
 /// Segments + usage from a `generateContent` response (or a batch result line's `response`).
 pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
+    let blocked = |reason: &str| anyhow::Error::new(Blocked { reason: reason.to_string(), usage: extract_usage(v) });
     let Some(candidate) = v.get("candidates").and_then(|c| c.get(0)) else {
         let feedback = v.get("promptFeedback").or_else(|| v.get("prompt_feedback"));
         let reason = feedback.and_then(|f| f.get("blockReason").or_else(|| f.get("block_reason"))).and_then(Value::as_str);
         match reason {
-            Some(r) => bail!("blocked by Google ({r})"),
+            Some(r) => return Err(blocked(r)),
             None => bail!("Gemini returned no result"),
         }
     };
@@ -331,9 +364,18 @@ pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
         .unwrap_or_default();
     if text.trim().is_empty() {
         let reason = candidate["finishReason"].as_str().or(candidate["finish_reason"].as_str()).unwrap_or("unknown");
+        if BLOCK_FINISH_REASONS.contains(&reason) {
+            return Err(blocked(reason));
+        }
         bail!("Gemini returned no text (finish reason: {reason})");
     }
-    Ok(Transcription { segments: parse_json_segments(&text)?, usage: extract_usage(v), language: None, raw: Some(v.clone()) })
+    Ok(Transcription {
+        segments: parse_json_segments(&text)?,
+        usage: extract_usage(v),
+        language: None,
+        raw: Some(v.clone()),
+        fallback: None,
+    })
 }
 
 async fn generate_content(client: &reqwest::Client, cfg: &ProviderConfig, req: &Request<'_>) -> Result<Transcription> {
@@ -410,5 +452,79 @@ mod tests {
     fn parses_fenced_json() {
         let s = parse_json_segments("```json\n[{\"start\":\"00:01.5\",\"end\":3,\"speaker\":\"Speaker 1\",\"text\":\"hi\"}]\n```").unwrap();
         assert_eq!(s[0].start, 1.5);
+    }
+
+    #[test]
+    fn reports_blocks_with_their_usage() {
+        let e = parse_generate_response(&json!({"promptFeedback": {"blockReason": "OTHER"},
+            "usageMetadata": {"promptTokenCount": 7279, "thoughtsTokenCount": 1566}}))
+        .unwrap_err();
+        let b = e.downcast_ref::<Blocked>().unwrap();
+        assert_eq!((b.reason.as_str(), b.usage.input_tokens, b.usage.output_tokens), ("OTHER", 7279, 1566));
+        assert_eq!(e.to_string(), "blocked by Google (OTHER)");
+        // A withheld answer is a block; an empty one isn't.
+        let safety = json!({"candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]});
+        assert!(parse_generate_response(&safety).unwrap_err().downcast_ref::<Blocked>().is_some());
+        let empty = json!({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]});
+        assert!(parse_generate_response(&empty).unwrap_err().downcast_ref::<Blocked>().is_none());
+    }
+
+    #[test]
+    fn only_general_models_fall_back() {
+        let cfg = |kind: ProviderKind, model: &str| ProviderConfig {
+            id: "g".into(), name: "G".into(), kind, base_url: String::new(), api_key: String::new(), model: model.into(),
+            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+        };
+        assert_eq!(block_fallback(&cfg(ProviderKind::Gemini, "gemini-3.8-flash")), Some(BLOCK_FALLBACK_MODEL));
+        assert_eq!(block_fallback(&cfg(ProviderKind::Gemini, BLOCK_FALLBACK_MODEL)), Some(LAST_RESORT_MODEL));
+        assert_eq!(block_fallback(&cfg(ProviderKind::Gemini, LAST_RESORT_MODEL)), None);
+        assert_eq!(block_fallback(&cfg(ProviderKind::Openai, "whisper-1")), None);
+    }
+
+    /// Against a local fake that blocks every model but the fallback: `python3 scripts/mock_gemini_batch.py`
+    /// then `MOCK_BATCH_URL=http://127.0.0.1:8766 cargo test falls_back_on_block -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn falls_back_on_block_against_mock() {
+        let cfg = ProviderConfig {
+            id: "gemini".into(), name: "Gemini".into(), kind: ProviderKind::Gemini,
+            base_url: std::env::var("MOCK_BATCH_URL").unwrap(), api_key: "test-key".into(), model: "gemini-3.8-flash".into(),
+            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+        };
+        let path = std::env::temp_dir().join("fallback-test.ogg");
+        std::fs::write(&path, b"fake-audio").unwrap();
+        let messages = std::sync::Mutex::new(Vec::new());
+        let on_retry = |m: String| messages.lock().unwrap().push(m);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let req = Request { path: &path, duration: 60.0, language: Some("fil"), known_speakers: &[], previous_text: "", on_retry: &on_retry, cancel: &cancel };
+        let client = reqwest::Client::new();
+        let at = |prefix: &str, model: &str| ProviderConfig { base_url: format!("{}{prefix}", cfg.base_url), model: model.into(), ..cfg.clone() };
+        let blocked_on = |f: &crate::providers::Fallback| f.blocked.iter().map(|(m, u)| (m.clone(), u.input_tokens)).collect::<Vec<_>>();
+
+        // 3.8 Flash blocked → 3.5 Flash.
+        let t = super::super::transcribe(&client, &cfg, &req).await.unwrap();
+        assert_eq!(t.segments[0].text, format!("text from {BLOCK_FALLBACK_MODEL}"));
+        let f = t.fallback.unwrap();
+        assert_eq!((f.model.as_str(), blocked_on(&f)), (BLOCK_FALLBACK_MODEL, vec![("gemini-3.8-flash".into(), 1500)]));
+        assert_eq!(f.blocked[0].1.output_tokens, 400);
+        assert!(messages.lock().unwrap()[0].contains("blocked this part on gemini-3.8-flash (OTHER) — re-doing it with gemini-3.5-flash"));
+
+        // 3.5 Flash blocked too → 3.5 Transcribe.
+        let t = super::super::transcribe(&client, &at("/flash-blocks", "gemini-3.8-flash"), &req).await.unwrap();
+        assert_eq!((t.segments[0].text.as_str(), t.segments[0].speaker.as_deref()), ("text from gemini-3.5-transcribe", Some("Speaker 1")));
+        assert_eq!(t.usage.input_tokens, 1200);
+        let f = t.fallback.unwrap();
+        assert_eq!(f.model, LAST_RESORT_MODEL);
+        assert_eq!(blocked_on(&f), vec![("gemini-3.8-flash".into(), 1500), (BLOCK_FALLBACK_MODEL.into(), 1500)]);
+        assert_eq!(f.blocked_models(), "gemini-3.8-flash and gemini-3.5-flash");
+
+        // Everything fails: the error says which models were tried, and nothing after 3.5 Transcribe.
+        let e = super::super::transcribe(&client, &at("/always-block", "gemini-3.8-flash"), &req).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.starts_with("Google blocked this part on gemini-3.8-flash and gemini-3.5-flash, then re-doing it with gemini-3.5-transcribe failed: "), "{msg}");
+        // Starting on the last resort: its own error, nothing else tried.
+        let e = super::super::transcribe(&client, &at("/always-block", LAST_RESORT_MODEL), &req).await.unwrap_err();
+        assert!(!format!("{e:#}").starts_with("Google blocked"));
+        println!("fallback ok: {:?}", messages.lock().unwrap());
     }
 }

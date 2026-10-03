@@ -23,13 +23,20 @@ const manualEnd = ref("");
 const pricePerMinute = ref(0);
 
 // Same options as the last full run (provider, speed, silence…), so the fix matches the rest.
-const opts = ref<JobOptions>({
-  ...defaultOptions(props.settings, props.t.last_options?.provider_id ?? props.t.provider),
-  ...(props.t.last_options ?? {}),
-  title: null,
-  folder_id: null,
-  tag_ids: [],
-});
+// Fixes always run now; after an overnight batch, use the speaker-label provider (the batch
+// model is what blocked/skipped those parts in the first place).
+const last = props.t.last_options;
+const opts = ref<JobOptions>(
+  last?.batch
+    ? { ...defaultOptions(props.settings, props.settings.diarize_provider), language: last.language ?? null }
+    : {
+        ...defaultOptions(props.settings, last?.provider_id ?? props.t.provider),
+        ...(last ?? {}),
+        title: null,
+        folder_id: null,
+        tag_ids: [],
+      },
+);
 
 // Use today's (smaller, more reliable) chunk size even if the last run used longer chunks.
 {

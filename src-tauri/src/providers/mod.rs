@@ -40,6 +40,25 @@ pub struct Transcription {
     /// Raw provider response, saved for diagnosis (not cached).
     #[serde(skip)]
     pub raw: Option<serde_json::Value>,
+    /// Set when Google blocked this part on the job's model and another model transcribed it.
+    #[serde(default)]
+    pub fallback: Option<Fallback>,
+}
+
+/// A part re-done with other models after Google blocked it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Fallback {
+    /// The model that transcribed it in the end.
+    pub model: String,
+    /// The models that blocked it, in order, with what each blocked attempt billed (input + thinking).
+    pub blocked: Vec<(String, TokenUsage)>,
+}
+
+impl Fallback {
+    /// "gemini-3.8-flash and gemini-3.5-flash"
+    pub fn blocked_models(&self) -> String {
+        self.blocked.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join(" and ")
+    }
 }
 
 /// Find a detected-language field anywhere in a response.
@@ -141,14 +160,18 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     }
     let mut attempt = 0;
     let mut waited = 0u64;
+    // Each time Google blocks the part, it's re-done (and any retries go) with the next model:
+    // a general Gemini model → 3.5 Flash → 3.5 Transcribe.
+    let mut current = cfg.clone();
+    let mut blocked: Vec<(String, TokenUsage)> = Vec::new();
     loop {
         if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("Cancelled");
         }
         let call = async {
-            match cfg.kind {
-                ProviderKind::Openai => openai_compat::transcribe(client, cfg, req).await,
-                ProviderKind::Gemini => gemini::transcribe(client, cfg, req).await,
+            match current.kind {
+                ProviderKind::Openai => openai_compat::transcribe(client, &current, req).await,
+                ProviderKind::Gemini => gemini::transcribe(client, &current, req).await,
             }
         };
         // Cancel stops an in-flight request too (it can take minutes for long chunks).
@@ -156,6 +179,16 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
             r = call => r,
             _ = cancelled(req.cancel) => bail!("Cancelled"),
         };
+        let next = match &res {
+            Err(e) => e.downcast_ref::<gemini::Blocked>().and_then(|b| Some((gemini::block_fallback(&current)?, b))),
+            Ok(_) => None,
+        };
+        if let Some((model, b)) = next {
+            (req.on_retry)(format!("Google blocked this part on {} ({}) — re-doing it with {model}", current.model, b.reason));
+            blocked.push((current.model.clone(), b.usage));
+            current.model = model.to_string();
+            continue;
+        }
         let http = res.as_ref().err().and_then(|e| e.downcast_ref::<HttpError>());
         let rate_limited = http.is_some_and(|h| h.status == 429 && !h.daily);
         let retry = match &res {
@@ -188,7 +221,16 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
                 }
             }
             other => {
-                return other.map(|t| Transcription { segments: clamp(t.segments, req.duration), ..t })
+                let fallback = (!blocked.is_empty()).then(|| Fallback { model: current.model.clone(), blocked });
+                return match (other, fallback) {
+                    (Ok(t), fallback) => Ok(Transcription { segments: clamp(t.segments, req.duration), fallback, ..t }),
+                    (Err(e), Some(f)) => Err(e.context(format!(
+                        "Google blocked this part on {}, then re-doing it with {} failed",
+                        f.blocked_models(),
+                        f.model
+                    ))),
+                    (Err(e), None) => Err(e),
+                };
             }
         }
     }

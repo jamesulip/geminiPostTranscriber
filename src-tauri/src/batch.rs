@@ -4,7 +4,7 @@
 
 use crate::audio::{self, TimeMap};
 use crate::jobs::{emit, merge, Job, Progress};
-use crate::providers::gemini::transcription_request;
+use crate::providers::gemini::{transcription_request, BLOCK_FALLBACK_MODEL};
 use crate::providers::gemini_batch::{self, State};
 use crate::providers::{Segment, TokenUsage};
 use crate::settings::{self, ProviderConfig};
@@ -175,8 +175,8 @@ async fn poll_one(app: &AppHandle, id: &str, json: &str) -> Result<()> {
 }
 
 /// Turn per-chunk results into a transcript version, with quality notes and a usage record.
-/// Parts Google blocked or left empty are re-done right away with the speaker-label provider
-/// (Gemini 3.5 Transcribe) when `batch_retry_failed` is on.
+/// Parts Google blocked or left empty are re-done right away with Gemini 3.5 Flash (3.5 Transcribe
+/// if that's blocked too) when `batch_retry_failed` is on.
 fn save_results(
     app: &AppHandle,
     id: &str,
@@ -233,7 +233,7 @@ fn save_results(
     for (i, e) in &failed {
         let c = &chunks[*i];
         let span = format!("{}–{} min of sent audio", (c.offset / 60.0) as u64, ((c.offset + c.duration) / 60.0).ceil() as u64);
-        let next = if retry { "re-doing it now with Gemini 3.5 Transcribe" } else { "use “Fix problems” to re-do it" };
+        let next = if retry { "re-doing it now with Gemini 3.5 Flash" } else { "use “Fix problems” to re-do it" };
         notes.push(format!("Part {} ({span}): {e} — {next}", i + 1));
     }
     let merged = merge(&chunks, per_chunk, &meta.map);
@@ -281,7 +281,7 @@ fn save_results(
                 (meta.map.to_original(c.offset), meta.map.to_original_end(c.offset + c.duration))
             })
             .collect();
-        if let Err(e) = retry_failed_parts(app, id, meta, &s, ranges) {
+        if let Err(e) = retry_failed_parts(app, id, meta, cfg, &s, ranges) {
             let db = state.db.lock().unwrap();
             let _ = db::mark_failed(&db, id, &format!("Couldn't re-do the blocked parts automatically: {e}. Use “Fix problems”."));
         }
@@ -334,14 +334,17 @@ fn record_usage(
     Ok(cost_usd)
 }
 
-/// Start a "Fix problems" job for the failed ranges with the speaker-label provider.
-fn retry_failed_parts(app: &AppHandle, id: &str, meta: &BatchMeta, s: &settings::Settings, ranges: Vec<(f64, f64)>) -> Result<()> {
+/// Start a "Fix problems" job for the failed ranges with the batch's provider and the model
+/// that blocked parts fall back to.
+fn retry_failed_parts(
+    app: &AppHandle,
+    id: &str,
+    meta: &BatchMeta,
+    cfg: &ProviderConfig,
+    s: &settings::Settings,
+    ranges: Vec<(f64, f64)>,
+) -> Result<()> {
     let state = app.state::<AppState>();
-    let provider = s
-        .providers
-        .iter()
-        .find(|p| p.id == s.diarize_provider && p.diarizes())
-        .ok_or_else(|| anyhow!("no speaker-label provider configured"))?;
     let audio_path = {
         let db = state.db.lock().unwrap();
         let t = db::get_transcript(&db, id)?.ok_or_else(|| anyhow!("transcript not found"))?;
@@ -349,8 +352,8 @@ fn retry_failed_parts(app: &AppHandle, id: &str, meta: &BatchMeta, s: &settings:
         std::path::PathBuf::from(t.audio_path)
     };
     let opts = crate::jobs::JobOptions {
-        provider_id: provider.id.clone(),
-        model: Some(provider.model.clone()),
+        provider_id: cfg.id.clone(),
+        model: Some(BLOCK_FALLBACK_MODEL.to_string()),
         language: meta.language.clone(),
         speed: s.diarize_speed,
         remove_silence: meta.condensed,

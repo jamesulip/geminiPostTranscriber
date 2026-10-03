@@ -68,17 +68,25 @@ const virtualizer = useVirtualizer(
 );
 const items = computed(() => virtualizer.value.getVirtualItems().map((item) => ({ item, row: rows.value[item.index] })));
 
-/** Scroll a segment to the middle of the list (no-op if it's hidden, e.g. by "only matches"). */
+/**
+ * Scroll a segment to the middle of the list (no-op if it's hidden, e.g. by "only matches").
+ * `smooth` only applies to nearby rows; far jumps (e.g. seeking while following) are instant.
+ */
 async function scrollToSegment(id: number, smooth = false) {
   await nextTick();
   const i = rows.value.findIndex((r) => r.kind === "seg" && r.seg.id === id);
-  if (i >= 0) virtualizer.value.scrollToIndex(i, { align: "center", behavior: smooth ? "smooth" : "auto" });
+  if (i < 0) return;
+  const v = virtualizer.value;
+  const target = v.getOffsetForIndex(i, "center")?.[0] ?? 0;
+  const near = Math.abs(target - (v.scrollOffset ?? 0)) < 2 * (scroller.value?.clientHeight ?? 0);
+  v.scrollToIndex(i, { align: "center", behavior: smooth && near ? "smooth" : "auto" });
 }
 defineExpose({ scrollToSegment });
 </script>
 
 <template>
-  <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto px-6">
+  <!-- No browser scroll anchoring: it fights the virtualizer's own positioning on short jumps. -->
+  <div ref="scroller" class="min-h-0 flex-1 overflow-y-auto px-6 [overflow-anchor:none]">
     <div class="relative w-full" :style="{ height: `${virtualizer.getTotalSize()}px` }">
       <div class="absolute inset-x-0 top-0" :style="{ transform: `translateY(${items[0]?.item.start ?? 0}px)` }">
         <!-- Each row is measured as a whole, so spacing must be padding (margins aren't measured). -->
