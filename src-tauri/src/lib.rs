@@ -1,6 +1,7 @@
 mod audio;
 mod batch;
 mod db;
+mod diarize;
 mod export;
 mod jobs;
 mod providers;
@@ -218,6 +219,45 @@ async fn audio_levels(state: State<'_, AppState>, id: String) -> CmdResult<Audio
     };
     let levels = audio::ensure_levels(&original).await.map_err(err)?;
     Ok(AudioLevels { step: audio::LEVEL_STEP, levels })
+}
+
+/// Find who spoke when with the local diarizer and relabel the current version's segments.
+/// Runs as a job (progress under the transcript id); the previous labeling is kept as a version.
+#[tauri::command]
+fn diarize_transcript(app: AppHandle, state: State<AppState>, id: String, num_speakers: Option<i32>) -> CmdResult<()> {
+    if num_speakers.is_some_and(|n| !(1..=20).contains(&n)) {
+        return Err("Number of speakers must be between 1 and 20".into());
+    }
+    {
+        let mut cancels = state.cancels.lock().unwrap();
+        if cancels.contains_key(&id) {
+            return Err("A job is already running for this transcript".into());
+        }
+        cancels.insert(id.clone(), Arc::new(AtomicBool::new(false)));
+    }
+    let cancel = state.cancels.lock().unwrap().get(&id).cloned().unwrap();
+    tauri::async_runtime::spawn(async move {
+        let result = diarize::run(app.clone(), id.clone(), num_speakers, cancel).await;
+        let state = app.state::<AppState>();
+        state.cancels.lock().unwrap().remove(&id);
+        state.progress.lock().unwrap().remove(&id);
+        let (message, error) = match result {
+            Ok(a) => (format!("Found {} speaker(s)", a.speakers.len()), None),
+            Err(e) => (String::new(), Some(format!("{e:#}"))),
+        };
+        use tauri::Emitter;
+        let _ = app.emit(
+            "job-progress",
+            jobs::Progress { id, stage: diarize::STAGE.into(), progress: 1.0, message, done: true, error },
+        );
+    });
+    Ok(())
+}
+
+/// Whether the diarization models are already downloaded (first run fetches about 45 MB).
+#[tauri::command]
+fn diarization_models_ready(state: State<AppState>) -> bool {
+    diarize::models_ready(&state.data_dir)
 }
 
 /// Stretches of the current version that look wrong (missing text, loops, impossible timings,
@@ -509,6 +549,8 @@ pub fn run() {
             speech_in_gaps,
             playback_audio,
             audio_levels,
+            diarize_transcript,
+            diarization_models_ready,
             repair_transcript,
             cancel_job,
             job_progress,

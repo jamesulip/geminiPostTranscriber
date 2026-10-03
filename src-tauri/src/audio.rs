@@ -504,6 +504,13 @@ pub async fn ensure_levels(original: &Path) -> Result<Vec<u8>> {
     Ok(levels)
 }
 
+/// Decode a whole file to 16 kHz mono PCM WAV (what the speaker models expect).
+pub async fn decode_wav16k(input: &Path, out: &Path) -> Result<()> {
+    let (src, dst) = (input.to_string_lossy().to_string(), out.to_string_lossy().to_string());
+    ffmpeg(&["-y", "-i", &src, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", &dst]).await?;
+    Ok(())
+}
+
 pub async fn extract_range(input: &Path, start: f64, duration: f64, out: &Path) -> Result<()> {
     let (ss, t) = (format!("{start:.3}"), format!("{duration:.3}"));
     let (src, dst) = (input.to_string_lossy().to_string(), out.to_string_lossy().to_string());

@@ -7,7 +7,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
   AlertCircle, AlertTriangle, ArrowLeft, Check, Download, GitCompare, History, Loader2, LocateFixed, MoreHorizontal, Pause,
-  Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, Users, Wrench,
+  Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, UserSearch, Users, Wrench,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +22,7 @@ import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
 import LevelMeter from "@/components/LevelMeter.vue";
 import SpeakerIdDialog from "@/components/SpeakerIdDialog.vue";
+import DiarizeDialog from "@/components/DiarizeDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
@@ -79,6 +80,10 @@ function openSpeakerMenu(seg: SegmentRow, anchor: HTMLElement) {
 }
 const renaming = ref<string | null>(null);
 const identifying = ref(false);
+const diarizing = ref(false);
+/** Local speaker-finding job for this transcript (status stays "done" while it runs). */
+const diarizeJob = computed(() => (job.value?.stage === "diarize" ? job.value : undefined));
+const busy = computed(() => t.value?.status === "processing" || t.value?.status === "queued" || !!diarizeJob.value);
 
 function openIdentify() {
   audio.value?.pause();
@@ -480,6 +485,7 @@ const saved = computed(() =>
             <Wrench /> Fix problems…
           </DropdownMenuItem>
           <DropdownMenuItem :disabled="!speakerOrder.length || readOnly" @click="openIdentify"><Users /> Identify speakers…</DropdownMenuItem>
+          <DropdownMenuItem :disabled="busy || !t.segments.length || !!viewing" @click="diarizing = true"><UserSearch /> Find speakers on this Mac…</DropdownMenuItem>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
           <DropdownMenuItem v-if="t.status === 'processing' || t.status === 'queued'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
@@ -531,6 +537,13 @@ const saved = computed(() =>
       <AlertTriangle class="size-4 shrink-0 text-amber-600" />
       <span class="min-w-0 truncate" :title="t.error">Last re-transcription failed — still showing v{{ t.version }}. {{ t.error }}</span>
       <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="openRetry"><RefreshCw /> Retry</Button>
+    </div>
+
+    <div v-if="diarizeJob" class="flex items-center gap-3 border-b px-6 py-2 text-sm">
+      <Loader2 class="text-primary size-4 shrink-0 animate-spin" />
+      <span class="min-w-0 truncate">{{ jobs.cancelling.has(t.id) ? "Cancelling…" : diarizeJob.message }}</span>
+      <Progress :model-value="diarizeJob.progress * 100" class="h-1.5 w-56" />
+      <Button size="sm" variant="ghost" class="ml-auto shrink-0" :disabled="jobs.cancelling.has(t.id)" @click="jobs.cancel(t.id)">Cancel</Button>
     </div>
 
     <!-- Player + timeline -->
@@ -686,6 +699,13 @@ const saved = computed(() =>
             title="Listen to a clip of each speaker and name them"
             @click="openIdentify"
           ><Users /> Identify speakers…</Button>
+          <Button
+            v-else-if="!readOnly && !busy"
+            variant="outline"
+            size="sm"
+            title="Find who spoke when with the local diarizer (no API needed)"
+            @click="diarizing = true"
+          ><UserSearch /> Find speakers…</Button>
         </div>
       </div>
 
@@ -766,6 +786,15 @@ const saved = computed(() =>
       :src="src"
       @close="identifying = false"
       @saved="(identifying = false), load()"
+    />
+
+    <DiarizeDialog
+      v-if="diarizing"
+      :transcript-id="t.id"
+      :duration="duration"
+      :speaker-count="speakerOrder.length"
+      @close="diarizing = false"
+      @started="diarizing = false"
     />
 
     <PromptDialog

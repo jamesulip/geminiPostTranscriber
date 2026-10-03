@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS transcript_versions (
   UNIQUE (transcript_id, number)
 );
 
+-- Speaker turns found by the local diarizer (latest run per transcript), kept for re-use.
+CREATE TABLE IF NOT EXISTS diarizations (
+  transcript_id TEXT PRIMARY KEY REFERENCES transcripts(id) ON DELETE CASCADE,
+  model TEXT NOT NULL,
+  num_speakers INTEGER,
+  created_at TEXT NOT NULL,
+  turns_json TEXT NOT NULL
+);
+
 -- Overnight batches sent to Google (kept after they finish, for the Batches page).
 CREATE TABLE IF NOT EXISTS batches (
   name TEXT PRIMARY KEY,
@@ -212,7 +221,7 @@ pub struct SegmentRow {
     pub text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Speaker {
     pub label: String,
     pub display_name: String,
@@ -735,6 +744,42 @@ pub fn delete_transcript(c: &Connection, id: &str) -> Result<Option<String>> {
         c.query_row("SELECT audio_path FROM transcripts WHERE id = ?1", [id], |r| r.get(0)).optional()?;
     c.execute("DELETE FROM transcripts WHERE id = ?1", [id])?;
     Ok(audio)
+}
+
+/// Replace the speaker labels of the current version (text untouched), archiving the previous
+/// labeling as a version so it can be restored.
+pub fn apply_speakers(c: &mut Connection, id: &str, labels: &[(i64, Option<String>)], speakers: &[Speaker]) -> Result<()> {
+    let tx = c.transaction()?;
+    let archived = archive_current(&tx, id)?;
+    {
+        let mut st = tx.prepare("UPDATE segments SET speaker = ?2 WHERE id = ?1 AND transcript_id = ?3")?;
+        for (sid, label) in labels {
+            st.execute(params![sid, label, id])?;
+        }
+    }
+    tx.execute("DELETE FROM speakers WHERE transcript_id = ?1", [id])?;
+    for s in speakers {
+        tx.execute("INSERT INTO speakers (transcript_id, label, display_name) VALUES (?1, ?2, ?3)", params![id, s.label, s.display_name])?;
+    }
+    if archived {
+        tx.execute(
+            "UPDATE transcripts SET version = (SELECT MAX(version, COALESCE((SELECT MAX(number) FROM transcript_versions WHERE transcript_id = ?1), 0)) + 1
+               FROM transcripts WHERE id = ?1), transcribed_at = ?2 WHERE id = ?1",
+            params![id, chrono::Local::now().to_rfc3339()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn save_diarization(c: &Connection, id: &str, model: &str, num_speakers: Option<i32>, turns_json: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO diarizations (transcript_id, model, num_speakers, created_at, turns_json) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(transcript_id) DO UPDATE SET model = excluded.model, num_speakers = excluded.num_speakers,
+           created_at = excluded.created_at, turns_json = excluded.turns_json",
+        params![id, model, num_speakers, chrono::Local::now().to_rfc3339(), turns_json],
+    )?;
+    Ok(())
 }
 
 pub fn rename_speaker(c: &Connection, id: &str, label: &str, name: &str) -> Result<()> {

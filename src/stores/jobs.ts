@@ -29,6 +29,7 @@ export const useJobs = defineStore("jobs", () => {
         if (p.stage === "queued") toast(`${title}: sent as an overnight batch`, { description: "Results usually arrive within 24 hours. Keep the app open now and then to collect them." });
         else if (wasCancelled) toast(`${title} cancelled`, { description: "Finished chunks are kept; Retry continues from there." });
         else if (p.error) toast.error(`${title} failed`, { description: p.error });
+        else if (p.stage === "diarize") toast.success(`${title}: ${p.message || "speakers found"}`, { description: "The previous speaker labels were kept in the history." });
         else toast.success(`${title} transcribed`);
       } else {
         progress[p.id] = p;

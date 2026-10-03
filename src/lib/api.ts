@@ -261,6 +261,9 @@ export const api = {
   /** MP3 copy of the audio (made on first use) for recordings the player can't open directly. */
   playbackAudio: (id: string) => invoke<string>("playback_audio", { id }),
   audioLevels: (id: string) => invoke<AudioLevels>("audio_levels", { id }),
+  /** Find who spoke when with the local diarizer; progress arrives as a "diarize" job. */
+  diarize: (id: string, numSpeakers: number | null) => invoke<void>("diarize_transcript", { id, numSpeakers }),
+  diarizationModelsReady: () => invoke<boolean>("diarization_models_ready"),
   speechInGaps: (id: string, gaps: [number, number][]) => invoke<number[]>("speech_in_gaps", { id, gaps }),
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),
