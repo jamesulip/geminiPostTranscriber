@@ -27,7 +27,7 @@ import DiarizeDialog from "@/components/DiarizeDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
 import AiPanel from "@/components/AiPanel.vue";
-import { ClipboardCopy, FileText, Languages, Sparkles } from "@lucide/vue";
+import { ClipboardCopy, Languages, Sparkles } from "@lucide/vue";
 import { useAi } from "@/stores/ai";
 import { useLocalStorage } from "@vueuse/core";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
@@ -135,25 +135,6 @@ async function copyAsContext() {
   const head = `# ${t.value.title}${t.value.recorded_at ? ` (${formatDate(t.value.recorded_at)})` : ""}\n\n`;
   await navigator.clipboard.writeText(head + lines.join("\n"));
   toast.success(`Copied ${lines.length} line(s)`);
-}
-
-const briefing = ref(false);
-async function exportBrief() {
-  if (!t.value || briefing.value) return;
-  briefing.value = true;
-  toast("Writing the project brief…", { description: "About half a minute." });
-  try {
-    const md = await api.aiBrief({ kind: "transcript", id: t.value.id });
-    const path = await save({ defaultPath: `${t.value.title} — brief.md`, filters: [{ name: "Markdown", extensions: ["md"] }] });
-    if (path) {
-      await api.saveText(path, md);
-      toast.success("Brief exported");
-    }
-  } catch (e) {
-    toast.error("Brief failed", { description: String(e) });
-  } finally {
-    briefing.value = false;
-  }
 }
 
 /** Right-hand assistant panel (summary + questions); ⌘J toggles it. */
@@ -577,8 +558,6 @@ const saved = computed(() =>
           <DropdownMenuItem @click="doExport('srt')">Subtitles (.srt)</DropdownMenuItem>
           <DropdownMenuItem @click="doExport('vtt')">WebVTT (.vtt)</DropdownMenuItem>
           <DropdownMenuItem @click="doExport('json')">JSON (.json)</DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem :disabled="briefing" @click="exportBrief"><FileText /> Project brief (.md)…</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <Button

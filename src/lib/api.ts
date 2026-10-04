@@ -74,6 +74,8 @@ export interface Settings {
   /** Keep a whole transcript in the provider's prompt cache while asking several questions. */
   ai_context_cache: boolean;
   ai_context_cache_ttl_minutes: number;
+  /** Custom document templates; an id matching a built-in overrides it. */
+  ai_templates: AiTemplate[];
   remove_silence: boolean;
   silence_method: SilenceMethod;
   vad_threshold: number;
@@ -378,6 +380,15 @@ export interface AiAnswerEvent {
   error: string | null;
 }
 
+export interface AiTemplate {
+  id: string;
+  name: string;
+  description: string;
+  /** What to produce; the app adds citation rules and the meeting material. */
+  prompt: string;
+  builtin?: boolean;
+}
+
 export interface AskParams {
   thread_id: string | null;
   scope: Scope;
@@ -443,8 +454,9 @@ export const api = {
   aiSearch: (query: string, scope: Scope, limit = 20) => invoke<Retrieval>("ai_search", { query, scope, limit }),
   aiEmbedLibrary: () => invoke<void>("ai_embed_library"),
   aiTestConnection: (providerId: string, model: string) => invoke<string>("ai_test_connection", { providerId, model }),
-  /** Markdown project brief with citations for a scope (takes ~30 s). */
-  aiBrief: (scope: Scope) => invoke<string>("ai_brief", { scope }),
+  aiTemplates: () => invoke<AiTemplate[]>("ai_templates"),
+  /** Markdown document with citations from a template, for a scope (takes ~30 s). */
+  aiDocument: (scope: Scope, templateId: string) => invoke<string>("ai_document", { scope, templateId }),
   /** Translate to English in the background; result arrives as the `translation_en` digest. */
   aiTranslate: (id: string, force = false) => invoke<void>("ai_translate", { id, force }),
   saveText: (path: string, text: string) => invoke<void>("save_text", { path, text }),

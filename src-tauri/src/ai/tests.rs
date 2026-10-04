@@ -162,6 +162,12 @@ async fn ai_end_to_end() {
         assert_eq!(c2.thread.id, a.thread.id);
         assert_eq!(store::messages_for(&db.lock().unwrap(), &a.thread.id).unwrap().len(), 4);
 
+        // Documents from templates come from the digests and are stored per transcript.
+        let doc = docs::generate(&ctx, &Scope::Transcript { id: "t1".into() }, "mom").await.unwrap();
+        assert!(doc.contains("Sources:") && doc.contains("t1"), "{doc}");
+        assert!(store::digest(&db.lock().unwrap(), "t1", "doc:mom").unwrap().is_some());
+        assert!(docs::generate(&ctx, &Scope::Library, "nope").await.is_err());
+
         // Whole-transcript mode; on Gemini this goes through cachedContents.
         let full = ask::ask(&ctx, ask::AskParams { thread_id: None, scope: Scope::Transcript { id: "t1".into() }, question: format!("Summarise everything ({kind:?})"), read_all: true }).await.unwrap();
         if kind == ProviderKind::Gemini {

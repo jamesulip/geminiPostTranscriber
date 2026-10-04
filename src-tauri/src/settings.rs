@@ -182,6 +182,17 @@ pub struct Settings {
     /// Keep a whole transcript in the provider's prompt cache while asking several questions.
     pub ai_context_cache: bool,
     pub ai_context_cache_ttl_minutes: u32,
+    /// User-defined document templates (minutes, reports…); an id matching a built-in overrides it.
+    pub ai_templates: Vec<AiTemplate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub prompt: String,
 }
 
 impl Default for Settings {
@@ -248,6 +259,7 @@ impl Default for Settings {
             ai_auto_digest: true,
             ai_context_cache: false,
             ai_context_cache_ttl_minutes: 60,
+            ai_templates: Vec::new(),
         }
     }
 }

@@ -5,6 +5,7 @@ import { toast } from "vue-sonner";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import AskChat from "./AskChat.vue";
+import AiDocuments from "./AiDocuments.vue";
 import { api, type Digest, type TranscriptDetail } from "@/lib/api";
 import { formatDate, formatTime } from "@/lib/format";
 import { renderMarkdown } from "@/lib/markdown";
@@ -16,7 +17,7 @@ const emit = defineEmits<{ seek: [time: number]; open: [id: string, time: number
 
 const ai = useAi();
 const settingsStore = useSettings();
-const tab = ref<"summary" | "ask">("summary");
+const tab = ref<"summary" | "ask" | "docs">("summary");
 const digests = ref<Digest[]>([]);
 const key = computed(() => `digest:${props.t.id}`);
 const running = computed(() => ai.running[key.value]);
@@ -74,7 +75,7 @@ const seekable = (time: number | null | undefined) => typeof time === "number" &
   <div class="flex h-full min-h-0 flex-col">
     <div class="flex items-center gap-1 border-b px-2 py-1.5">
       <button
-        v-for="x in [{ id: 'summary', label: 'Summary' }, { id: 'ask', label: 'Ask' }] as const"
+        v-for="x in [{ id: 'summary', label: 'Summary' }, { id: 'ask', label: 'Ask' }, { id: 'docs', label: 'Docs' }] as const"
         :key="x.id"
         class="rounded-md px-2.5 py-1 text-sm"
         :class="tab === x.id ? 'bg-accent font-medium' : 'text-muted-foreground hover:bg-accent/50'"
@@ -174,6 +175,14 @@ const seekable = (time: number | null | undefined) => typeof time === "number" &
       </template>
     </div>
 
+    <AiDocuments
+      v-else-if="tab === 'docs'"
+      class="min-h-0 flex-1"
+      :scope="{ kind: 'transcript', id: t.id }"
+      :current-id="t.id"
+      @seek="(time) => emit('seek', time)"
+      @open="(id, time) => emit('open', id, time)"
+    />
     <AskChat
       v-else
       class="min-h-0 flex-1"

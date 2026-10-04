@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { FileText, Loader2, Sparkles } from "@lucide/vue";
-import { save } from "@tauri-apps/plugin-dialog";
-import { toast } from "vue-sonner";
+import { FileText, Sparkles } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import AiDocuments from "@/components/AiDocuments.vue";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import AskChat from "@/components/AskChat.vue";
 import { api, type Scope, type TranscriptSummary } from "@/lib/api";
@@ -46,24 +46,7 @@ onMounted(async () => {
   all.value = await api.listTranscripts({ folder_id: null, tag_id: null, recursive: true, trashed: false });
 });
 
-const briefing = ref(false);
-async function exportBrief() {
-  if (briefing.value) return;
-  briefing.value = true;
-  toast("Writing the project brief…", { description: "About half a minute; only meetings with a summary are included." });
-  try {
-    const md = await api.aiBrief(scope.value);
-    const path = await save({ defaultPath: "Project brief.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
-    if (path) {
-      await api.saveText(path, md);
-      toast.success("Brief exported");
-    }
-  } catch (e) {
-    toast.error("Brief failed", { description: String(e) });
-  } finally {
-    briefing.value = false;
-  }
-}
+const docsOpen = ref(false);
 
 function open(id: string, time: number) {
   router.push({ name: "transcript", params: { id }, query: { t: String(time) } });
@@ -80,8 +63,8 @@ function open(id: string, time: number) {
       </div>
       <div class="ml-auto flex items-center gap-2">
         <span class="text-muted-foreground text-xs">{{ count }} meeting(s)</span>
-        <Button variant="outline" size="sm" :disabled="briefing || !count" title="Requirements, decisions, constraints and open questions for developers, with citations" @click="exportBrief">
-          <Loader2 v-if="briefing" class="animate-spin" /><FileText v-else /> Export brief
+        <Button variant="outline" size="sm" :disabled="!count" title="Minutes, action-item email, status update, brief, user stories… written from these meetings" @click="docsOpen = true">
+          <FileText /> Documents
         </Button>
         <Select v-model="key">
           <SelectTrigger class="w-56"><SelectValue /></SelectTrigger>
@@ -96,5 +79,14 @@ function open(id: string, time: number) {
     <div class="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
       <AskChat :scope="scope" :titles="titles" :initial="initial" @open="open" @seek="() => {}" />
     </div>
+    <Dialog v-model:open="docsOpen">
+      <DialogContent class="flex h-[80vh] flex-col gap-0 p-0 sm:max-w-3xl">
+        <DialogHeader class="border-b px-4 py-3">
+          <DialogTitle>Documents from {{ count }} meeting(s)</DialogTitle>
+          <DialogDescription>Written from the stored summaries, with citations.</DialogDescription>
+        </DialogHeader>
+        <AiDocuments class="min-h-0 flex-1" :scope="scope" :titles="titles" @open="(id, time) => { docsOpen = false; open(id, time); }" />
+      </DialogContent>
+    </Dialog>
   </div>
 </template>

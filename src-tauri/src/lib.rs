@@ -679,10 +679,16 @@ fn ai_embed_library(app: AppHandle) -> CmdResult<()> {
     Ok(())
 }
 
-/// Project brief (markdown with citations) for a transcript, folder, tag or the library.
+/// Document templates (built-in + custom from Settings).
 #[tauri::command]
-async fn ai_brief(app: AppHandle, scope: ai::Scope) -> CmdResult<String> {
-    let handle = ai_run(&app, format!("brief:{}", uuid::Uuid::new_v4()), move |ctx| Box::pin(async move { ai::brief::brief(ctx, &scope).await }))?;
+fn ai_templates(state: State<AppState>) -> Vec<ai::docs::Template> {
+    ai::docs::templates(&settings::load(&state.settings_path()))
+}
+
+/// Generate a document (markdown with citations) from a template for a transcript, folder, tag or the library.
+#[tauri::command]
+async fn ai_document(app: AppHandle, scope: ai::Scope, template_id: String) -> CmdResult<String> {
+    let handle = ai_run(&app, format!("doc:{template_id}:{}", uuid::Uuid::new_v4()), move |ctx| Box::pin(async move { ai::docs::generate(ctx, &scope, &template_id).await }))?;
     handle.await.map_err(err)?
 }
 
@@ -837,7 +843,8 @@ pub fn run() {
             ai_search,
             ai_embed_library,
             ai_test_connection,
-            ai_brief,
+            ai_templates,
+            ai_document,
             ai_translate,
             save_text,
             list_folders,

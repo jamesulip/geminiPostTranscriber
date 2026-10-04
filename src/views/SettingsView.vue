@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watchEffect } from "vue";
 import { Eye, EyeOff, Loader2, Plus, Sparkles, Trash2 } from "@lucide/vue";
+import { Textarea } from "@/components/ui/textarea";
 import { toast } from "vue-sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,6 +37,10 @@ async function testAi() {
   } finally {
     testing.value = false;
   }
+}
+
+function addTemplate() {
+  form.value!.ai_templates.push({ id: `custom-${Date.now()}`, name: "", description: "", prompt: "" });
 }
 
 async function indexLibrary() {
@@ -261,6 +266,24 @@ async function save() {
                 </div>
               </div>
               <Switch id="ai-cache" v-model="form.ai_context_cache" />
+            </div>
+            <div class="col-span-2 grid gap-3 rounded-lg border p-3">
+              <div>
+                <Label>Custom document templates</Label>
+                <p class="text-muted-foreground text-xs">
+                  Besides the built-in minutes, action-item email, status update, brief, decision log, user stories, task list and Q&A.
+                  Describe the document you want (sections, tone, length); the app adds the meeting material and the citation rules.
+                </p>
+              </div>
+              <div v-for="(tpl, i) in form.ai_templates" :key="tpl.id" class="grid gap-2 rounded-md border p-3">
+                <div class="flex gap-2">
+                  <Input v-model="tpl.name" placeholder="Name, e.g. Client recap" class="h-8 max-w-64" />
+                  <Input v-model="tpl.description" placeholder="One-line description" class="h-8" />
+                  <Button variant="ghost" size="icon" class="size-8 shrink-0" @click="form.ai_templates.splice(i, 1)"><Trash2 /></Button>
+                </div>
+                <Textarea v-model="tpl.prompt" rows="4" placeholder="Write a recap for the client with: ## What we agreed, ## What we need from you, ## Timeline…" class="text-sm" />
+              </div>
+              <Button variant="outline" size="sm" class="w-fit" @click="addTemplate"><Plus /> Add template</Button>
             </div>
             <div class="col-span-2 flex items-center gap-3">
               <Button variant="outline" size="sm" :disabled="ai.isRunning('embed:library')" @click="indexLibrary">

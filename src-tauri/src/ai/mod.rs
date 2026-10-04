@@ -8,11 +8,11 @@
 //! 3. the provider's own prompt cache for "read the whole meeting" sessions.
 
 pub mod ask;
-pub mod brief;
 pub mod cache;
 pub mod chat;
 pub mod chunker;
 pub mod digest;
+pub mod docs;
 pub mod embed;
 pub mod prompts;
 pub mod retrieval;

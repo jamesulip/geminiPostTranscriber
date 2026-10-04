@@ -39,8 +39,3 @@ pub const TRANSLATE: &str = "Translate this part of a meeting transcript into na
 Keep one line per input line, keep the leading [time] Name: prefix exactly, keep names and technical terms as spoken, \
 and keep English passages as they are. Output only the translated lines.";
 
-pub const BRIEF: &str = "You write a project brief from meeting material for software developers who did not attend. \
-The material may mix Filipino/Tagalog and English; write in English, keeping names and technical terms as spoken. \
-Produce markdown with these sections, each a bullet list: ## Context, ## Requirements, ## Decisions, ## Constraints & risks, \
-## Open questions, ## Next steps. After every bullet put citation tokens [[t:TRANSCRIPT_ID:SECONDS]] using transcript ids \
-and timestamps from the material. Only include what the material supports; leave a section as \"- none recorded\" if empty.";
