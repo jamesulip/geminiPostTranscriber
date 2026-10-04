@@ -6,6 +6,7 @@ export const router = createRouter({
   routes: [
     { path: "/", name: "library", component: LibraryView },
     { path: "/t/:id", name: "transcript", component: () => import("./views/TranscriptView.vue") },
+    { path: "/ask", name: "ask", component: () => import("./views/AskView.vue") },
     { path: "/usage", name: "usage", component: () => import("./views/UsageView.vue") },
     { path: "/batches", name: "batches", component: () => import("./views/BatchesView.vue") },
     { path: "/settings", name: "settings", component: () => import("./views/SettingsView.vue") },

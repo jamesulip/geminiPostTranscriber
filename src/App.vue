@@ -8,13 +8,15 @@ import SearchDialog from "@/components/SearchDialog.vue";
 import { useLibrary } from "@/stores/library";
 import { useJobs } from "@/stores/jobs";
 import { useSettings } from "@/stores/settings";
+import { useAi } from "@/stores/ai";
 
 const library = useLibrary();
 const jobs = useJobs();
 const settings = useSettings();
+const ai = useAi();
 
 onMounted(async () => {
-  await Promise.all([library.refreshMeta(), library.refresh(), jobs.start(), settings.load()]);
+  await Promise.all([library.refreshMeta(), library.refresh(), jobs.start(), settings.load(), ai.start()]);
 });
 </script>
 

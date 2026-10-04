@@ -24,10 +24,18 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     if let Some(lang) = req.language.and_then(whisper_language) {
         form = form.text("language", lang);
     }
-    if !plain && !req.previous_text.is_empty() && !diarize {
-        // Whisper uses the prompt as preceding context, which helps continuity between chunks.
+    if !plain && !diarize {
+        // Whisper uses the prompt as preceding context: it helps continuity between chunks and
+        // teaches spellings of names/jargon (kept short: the prompt is capped at ~224 tokens).
+        let mut prompt = String::new();
+        if !req.glossary.is_empty() {
+            prompt = format!("{}. ", req.glossary.iter().take(15).cloned().collect::<Vec<_>>().join(", "));
+        }
         let tail: String = req.previous_text.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
-        form = form.text("prompt", tail);
+        prompt.push_str(&tail);
+        if !prompt.trim().is_empty() {
+            form = form.text("prompt", prompt);
+        }
     }
 
     let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));

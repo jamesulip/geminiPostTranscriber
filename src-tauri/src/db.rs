@@ -15,27 +15,76 @@ pub fn open(path: &Path) -> Result<Connection> {
 
 /// Additive migrations for libraries created by earlier versions.
 fn migrate(c: &Connection) -> Result<()> {
-    let cols: Vec<String> = c
-        .prepare("SELECT name FROM pragma_table_info('transcripts')")?
+    add_missing_columns(
+        c,
+        "transcripts",
+        &[
+            ("recorded_at", "TEXT"),
+            ("detected_language", "TEXT"),
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("transcribed_at", "TEXT"),
+            ("last_options", "TEXT"),
+            ("notes", "TEXT"),
+            ("partial", "TEXT"),
+            ("batch", "TEXT"),
+            // Identity of the current segments, so AI summaries/embeddings know when they're stale.
+            ("content_hash", "TEXT"),
+            ("flagged", "INTEGER NOT NULL DEFAULT 0"),
+            ("trashed_at", "TEXT"),
+        ],
+    )?;
+    // What a usage row paid for: 'transcribe' | 'ai' (questions, summaries) | 'embed'.
+    add_missing_columns(c, "usage", &[("kind", "TEXT NOT NULL DEFAULT 'transcribe'")])?;
+    Ok(())
+}
+
+fn add_missing_columns(c: &Connection, table: &str, cols: &[(&str, &str)]) -> Result<()> {
+    let existing: Vec<String> = c
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    for (name, ty) in [
-        ("recorded_at", "TEXT"),
-        ("detected_language", "TEXT"),
-        ("version", "INTEGER NOT NULL DEFAULT 1"),
-        ("transcribed_at", "TEXT"),
-        ("last_options", "TEXT"),
-        ("notes", "TEXT"),
-        ("partial", "TEXT"),
-        ("batch", "TEXT"),
-        ("flagged", "INTEGER NOT NULL DEFAULT 0"),
-        ("trashed_at", "TEXT"),
-    ] {
-        if !cols.iter().any(|c| c == name) {
-            c.execute_batch(&format!("ALTER TABLE transcripts ADD COLUMN {name} {ty}"))?;
+    for (name, ty) in cols {
+        if !existing.iter().any(|c| c == name) {
+            c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ty}"))?;
         }
     }
     Ok(())
+}
+
+/// Hash of what was said: segment order, timing, speaker label and text. Speaker display
+/// names are left out on purpose (renaming a speaker shouldn't stale summaries).
+pub fn content_hash(segs: &[SegmentRow]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for s in segs {
+        h.update(s.idx.to_le_bytes());
+        h.update(s.start.to_le_bytes());
+        h.update(s.end.to_le_bytes());
+        h.update(s.speaker.as_deref().unwrap_or("").as_bytes());
+        h.update([0u8]);
+        h.update(s.text.as_bytes());
+        h.update([0u8]);
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Recompute and store `transcripts.content_hash` from the current segments.
+pub fn refresh_content_hash(c: &Connection, id: &str) -> Result<String> {
+    let hash = content_hash(&segments_for(c, id)?);
+    c.execute("UPDATE transcripts SET content_hash = ?2 WHERE id = ?1", params![id, hash])?;
+    Ok(hash)
+}
+
+/// Fill in `content_hash` for libraries from before the AI assistant.
+pub fn backfill_content_hashes(c: &Connection) -> Result<usize> {
+    let ids: Vec<String> = c
+        .prepare("SELECT id FROM transcripts WHERE content_hash IS NULL AND EXISTS (SELECT 1 FROM segments s WHERE s.transcript_id = transcripts.id)")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in &ids {
+        refresh_content_hash(c, id)?;
+    }
+    Ok(ids.len())
 }
 
 const SCHEMA: &str = r#"
@@ -170,6 +219,78 @@ CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
   INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
   INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
 END;
+
+-- AI assistant -------------------------------------------------------------------------------
+-- Retrieval unit (~6-10 min of talk). `chunk_hash` covers the segments' text/timing/labels, so an
+-- edit re-summarises and re-embeds one chunk, not the transcript.
+CREATE TABLE IF NOT EXISTS ai_chunks (
+  id INTEGER PRIMARY KEY,
+  transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  start REAL NOT NULL,
+  end REAL NOT NULL,
+  first_idx INTEGER NOT NULL,
+  last_idx INTEGER NOT NULL,
+  chunk_hash TEXT NOT NULL,
+  text TEXT NOT NULL,
+  summary TEXT,
+  embedding BLOB,
+  embed_model TEXT,
+  UNIQUE (transcript_id, idx)
+);
+
+-- Per-transcript derived artifacts: 'summary' | 'decisions' | 'actions' | 'questions' | 'topics' |
+-- 'glossary' | 'translation_en' | 'brief'. Kept when stale (content_hash moved) until regenerated.
+CREATE TABLE IF NOT EXISTS ai_digests (
+  transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  prompt_version INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (transcript_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS ai_threads (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  scope_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+  id INTEGER PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES ai_threads(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  citations_json TEXT,
+  model TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ai_messages_thread ON ai_messages(thread_id, id);
+
+-- Provider-side prompt caches (Gemini cachedContents) holding one whole transcript.
+CREATE TABLE IF NOT EXISTS ai_context_cache (
+  transcript_id TEXT NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  model TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  cache_name TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  tokens INTEGER NOT NULL,
+  PRIMARY KEY (transcript_id, model)
+);
+
+-- Exact repeat questions over unchanged transcripts are answered from here.
+CREATE TABLE IF NOT EXISTS ai_answer_memo (
+  key TEXT PRIMARY KEY,
+  message_id INTEGER NOT NULL REFERENCES ai_messages(id) ON DELETE CASCADE
+);
 "#;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -215,6 +336,8 @@ pub struct TranscriptSummary {
     pub flagged: bool,
     /// Set while the transcript is in the trash.
     pub trashed_at: Option<String>,
+    /// Identity of the current segments (see `content_hash`); None until first computed.
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -487,6 +610,7 @@ pub fn commit_version_with_speakers(
         })
         .collect();
     insert_segments(&tx, id, &rows, speakers)?;
+    let hash = content_hash(&segments_for(&tx, id)?);
     let number: i64 = if archived {
         tx.query_row(
             "SELECT MAX((SELECT version FROM transcripts WHERE id = ?1),
@@ -499,10 +623,11 @@ pub fn commit_version_with_speakers(
     };
     tx.execute(
         "UPDATE transcripts SET version = ?2, provider = ?3, model = ?4, language = ?5, detected_language = ?6,
-           processed_duration = ?7, transcribed_at = ?8, error = NULL, notes = ?9, partial = NULL WHERE id = ?1",
+           processed_duration = ?7, transcribed_at = ?8, error = NULL, notes = ?9, partial = NULL, content_hash = ?10
+         WHERE id = ?1",
         params![
             id, number, v.provider, v.model, v.language, v.detected_language, v.processed_duration,
-            chrono::Local::now().to_rfc3339(), v.notes
+            chrono::Local::now().to_rfc3339(), v.notes, hash
         ],
     )?;
     tx.commit()?;
@@ -587,10 +712,12 @@ pub fn restore_version(c: &mut Connection, version_id: i64) -> Result<()> {
     let rows: Vec<SegmentRow> = serde_json::from_str(&segs)?;
     let speakers: Vec<Speaker> = serde_json::from_str(&speakers)?;
     insert_segments(&tx, &id, &rows, &speakers)?;
+    let hash = content_hash(&segments_for(&tx, &id)?);
     tx.execute(
         "UPDATE transcripts SET version = ?2, provider = ?3, model = ?4, language = ?5, detected_language = NULL,
-           processed_duration = ?6, transcribed_at = ?7, status = 'done', error = NULL, notes = NULL WHERE id = ?1",
-        params![id, number, provider, model, language, processed, transcribed_at],
+           processed_duration = ?6, transcribed_at = ?7, status = 'done', error = NULL, notes = NULL, content_hash = ?8
+         WHERE id = ?1",
+        params![id, number, provider, model, language, processed, transcribed_at, hash],
     )?;
     tx.commit()?;
     Ok(())
@@ -636,7 +763,7 @@ const SUMMARY_COLS: &str = "t.id, t.title, t.folder_id, t.source_name, t.duratio
     t.model, t.status, t.error, t.created_at,
     (SELECT substr(group_concat(text, ' '), 1, 200) FROM (SELECT text FROM segments s WHERE s.transcript_id = t.id ORDER BY idx LIMIT 3)),
     t.recorded_at, COALESCE(NULLIF(t.language, ''), t.detected_language), t.version, t.transcribed_at, t.notes,
-    t.flagged, t.trashed_at";
+    t.flagged, t.trashed_at, t.content_hash";
 
 fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
     Ok(TranscriptSummary {
@@ -660,6 +787,7 @@ fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
         notes: r.get(16)?,
         flagged: r.get::<_, i64>(17)? != 0,
         trashed_at: r.get(18)?,
+        content_hash: r.get(19)?,
     })
 }
 
@@ -696,7 +824,7 @@ pub fn list_transcripts(c: &Connection, f: &ListFilter) -> Result<Vec<Transcript
     Ok(out)
 }
 
-fn segments_for(c: &Connection, id: &str) -> Result<Vec<SegmentRow>> {
+pub fn segments_for(c: &Connection, id: &str) -> Result<Vec<SegmentRow>> {
     let mut st =
         c.prepare("SELECT id, idx, start, end, speaker, text FROM segments WHERE transcript_id = ?1 ORDER BY idx")?;
     let rows = st.query_map([id], |r| {
@@ -705,7 +833,7 @@ fn segments_for(c: &Connection, id: &str) -> Result<Vec<SegmentRow>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn speakers_for(c: &Connection, id: &str) -> Result<Vec<Speaker>> {
+pub fn speakers_for(c: &Connection, id: &str) -> Result<Vec<Speaker>> {
     let mut st = c.prepare("SELECT label, display_name FROM speakers WHERE transcript_id = ?1 ORDER BY label")?;
     let rows = st.query_map([id], |r| Ok(Speaker { label: r.get(0)?, display_name: r.get(1)? }))?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -717,10 +845,10 @@ pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetai
         .query_row(&sql, [id], |r| {
             Ok((
                 summary_from_row(r)?,
-                r.get::<_, String>(19)?,
-                r.get::<_, Option<String>>(20)?,
+                r.get::<_, String>(20)?,
                 r.get::<_, Option<String>>(21)?,
                 r.get::<_, Option<String>>(22)?,
+                r.get::<_, Option<String>>(23)?,
             ))
         })
         .optional()?;
@@ -803,6 +931,7 @@ pub fn apply_speakers(c: &mut Connection, id: &str, labels: &[(i64, Option<Strin
             params![id, chrono::Local::now().to_rfc3339()],
         )?;
     }
+    refresh_content_hash(&tx, id)?;
     tx.commit()?;
     Ok(())
 }
@@ -828,11 +957,16 @@ pub fn rename_speaker(c: &Connection, id: &str, label: &str, name: &str) -> Resu
 
 pub fn update_segment(c: &Connection, segment_id: i64, text: &str, speaker: Option<&str>) -> Result<()> {
     c.execute("UPDATE segments SET text = ?2, speaker = ?3 WHERE id = ?1", params![segment_id, text, speaker])?;
+    let id: Option<String> =
+        c.query_row("SELECT transcript_id FROM segments WHERE id = ?1", [segment_id], |r| r.get(0)).optional()?;
+    if let Some(id) = id {
+        refresh_content_hash(c, &id)?;
+    }
     Ok(())
 }
 
 /// Turn free text into a safe FTS5 prefix query: each word quoted, last word prefix-matched.
-fn fts_query(q: &str) -> Option<String> {
+pub fn fts_query(q: &str) -> Option<String> {
     let words: Vec<String> = q
         .split_whitespace()
         .map(|w| w.replace('"', ""))
@@ -893,7 +1027,9 @@ pub fn search(c: &Connection, q: &str, limit: i64) -> Result<Vec<SearchHit>> {
 // Usage ----------------------------------------------------------------------
 
 pub struct NewUsage<'a> {
-    pub transcript_id: &'a str,
+    /// 'transcribe' | 'ai' | 'embed'
+    pub kind: &'a str,
+    pub transcript_id: Option<&'a str>,
     pub title: &'a str,
     pub provider: &'a str,
     pub provider_name: &'a str,
@@ -930,12 +1066,12 @@ pub fn insert_usage(c: &Connection, u: &NewUsage) -> Result<()> {
     let (cost, saved) = (u.cost_usd, u.saved_usd);
     c.execute(
         "INSERT INTO usage (transcript_id, title, provider, provider_name, model, status, original_seconds, sent_seconds,
-           requests, input_tokens, output_tokens, price_per_minute, cost_usd, saved_usd, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+           requests, input_tokens, output_tokens, price_per_minute, cost_usd, saved_usd, created_at, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             u.transcript_id, u.title, u.provider, u.provider_name, u.model, u.status, u.original_seconds,
             u.sent_seconds, u.requests, u.input_tokens, u.output_tokens, u.price_per_minute, cost, saved,
-            chrono::Local::now().to_rfc3339()
+            chrono::Local::now().to_rfc3339(), u.kind
         ],
     )?;
     Ok(())
@@ -973,6 +1109,7 @@ fn totals_from(r: &rusqlite::Row, at: usize) -> rusqlite::Result<UsageTotals> {
 #[derive(Debug, Serialize, Clone)]
 pub struct UsageGroup {
     pub month: String,
+    pub kind: String,
     pub provider_name: String,
     pub model: String,
     #[serde(flatten)]
@@ -982,6 +1119,7 @@ pub struct UsageGroup {
 #[derive(Debug, Serialize, Clone)]
 pub struct UsageRow {
     pub id: i64,
+    pub kind: String,
     pub transcript_id: Option<String>,
     pub title: String,
     pub provider_name: String,
@@ -998,15 +1136,25 @@ pub struct UsageRow {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct UsageKindTotals {
+    pub kind: String,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct UsageSummary {
     pub all_time: UsageTotals,
     pub this_month: UsageTotals,
+    /// All-time totals per kind ('transcribe', 'ai', 'embed').
+    pub by_kind: Vec<UsageKindTotals>,
     pub by_month: Vec<UsageGroup>,
     pub recent: Vec<UsageRow>,
 }
 
+/// Transcription spend only (what the transcript header shows); AI questions are on the Usage page.
 pub fn usage_for_transcript(c: &Connection, id: &str) -> Result<UsageTotals> {
-    let sql = format!("SELECT {TOTALS_COLS} FROM usage WHERE transcript_id = ?1");
+    let sql = format!("SELECT {TOTALS_COLS} FROM usage WHERE transcript_id = ?1 AND kind = 'transcribe'");
     Ok(c.query_row(&sql, [id], |r| totals_from(r, 0))?)
 }
 
@@ -1018,24 +1166,29 @@ pub fn usage_summary(c: &Connection) -> Result<UsageSummary> {
         [&month],
         |r| totals_from(r, 0),
     )?;
+    let mut st = c.prepare(&format!("SELECT kind, {TOTALS_COLS} FROM usage GROUP BY kind ORDER BY SUM(cost_usd) DESC"))?;
+    let by_kind = st
+        .query_map([], |r| Ok(UsageKindTotals { kind: r.get(0)?, totals: totals_from(r, 1)? }))?
+        .collect::<Result<_, _>>()?;
     let mut st = c.prepare(&format!(
-        "SELECT substr(created_at, 1, 7) AS m, provider_name, model, {TOTALS_COLS} FROM usage
-         GROUP BY m, provider_name, model ORDER BY m DESC, SUM(cost_usd) DESC"
+        "SELECT substr(created_at, 1, 7) AS m, kind, provider_name, model, {TOTALS_COLS} FROM usage
+         GROUP BY m, kind, provider_name, model ORDER BY m DESC, SUM(cost_usd) DESC"
     ))?;
     let by_month = st
         .query_map([], |r| {
-            Ok(UsageGroup { month: r.get(0)?, provider_name: r.get(1)?, model: r.get(2)?, totals: totals_from(r, 3)? })
+            Ok(UsageGroup { month: r.get(0)?, kind: r.get(1)?, provider_name: r.get(2)?, model: r.get(3)?, totals: totals_from(r, 4)? })
         })?
         .collect::<Result<_, _>>()?;
     let mut st = c.prepare(
         "SELECT id, transcript_id, title, provider_name, model, status, original_seconds, sent_seconds, requests,
-                input_tokens, output_tokens, cost_usd, saved_usd, created_at
+                input_tokens, output_tokens, cost_usd, saved_usd, created_at, kind
          FROM usage ORDER BY created_at DESC LIMIT 100",
     )?;
     let recent = st
         .query_map([], |r| {
             Ok(UsageRow {
                 id: r.get(0)?,
+                kind: r.get(14)?,
                 transcript_id: r.get(1)?,
                 title: r.get(2)?,
                 provider_name: r.get(3)?,
@@ -1052,7 +1205,7 @@ pub fn usage_summary(c: &Connection) -> Result<UsageSummary> {
             })
         })?
         .collect::<Result<_, _>>()?;
-    Ok(UsageSummary { all_time, this_month, by_month, recent })
+    Ok(UsageSummary { all_time, this_month, by_kind, by_month, recent })
 }
 
 // Folders & tags ------------------------------------------------------------
@@ -1149,7 +1302,8 @@ mod tests {
         assert_eq!(list_transcripts(&c, &f).unwrap()[0].tags.len(), 1);
 
         let u = NewUsage {
-            transcript_id: "t1", title: "Standup", provider: "groq", provider_name: "Groq", model: "m", status: "done",
+            kind: "transcribe",
+            transcript_id: Some("t1"), title: "Standup", provider: "groq", provider_name: "Groq", model: "m", status: "done",
             original_seconds: 600.0, sent_seconds: 240.0, requests: 1, input_tokens: 0, output_tokens: 0,
             price_per_minute: 0.006,
             cost_usd: minute_cost(600.0, 240.0, 0.006).0,

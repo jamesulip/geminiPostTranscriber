@@ -1,12 +1,12 @@
 pub mod gemini;
 pub mod gemini_batch;
 pub mod openai_compat;
+pub mod retry;
 
 use crate::settings::{ProviderConfig, ProviderKind};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::Duration;
 
 /// A transcript segment. Times are relative to the audio that was sent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,12 +22,16 @@ pub struct Segment {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Part of `input_tokens` served from the provider's prompt cache (billed at a lower rate).
+    #[serde(default)]
+    pub cached_tokens: u64,
 }
 
 impl std::ops::AddAssign for TokenUsage {
     fn add_assign(&mut self, o: Self) {
         self.input_tokens += o.input_tokens;
         self.output_tokens += o.output_tokens;
+        self.cached_tokens += o.cached_tokens;
     }
 }
 
@@ -103,11 +107,11 @@ pub fn extract_usage(v: &serde_json::Value) -> TokenUsage {
             .map(|a| a.iter().filter_map(|m| m.get("tokens").or_else(|| m.get("token_count"))?.as_u64()).sum())
             .unwrap_or(0)
     };
-    let mut input = get(&["input_tokens", "total_input_tokens", "promptTokenCount", "prompt_token_count"]);
+    let mut input = get(&["input_tokens", "total_input_tokens", "promptTokenCount", "prompt_token_count", "prompt_tokens"]);
     if input == 0 {
         input = by_modality("input_tokens_by_modality");
     }
-    let mut output = get(&["output_tokens", "total_output_tokens", "candidatesTokenCount", "candidates_token_count"]);
+    let mut output = get(&["output_tokens", "total_output_tokens", "candidatesTokenCount", "candidates_token_count", "completion_tokens"]);
     if output == 0 {
         output = by_modality("output_tokens_by_modality");
     }
@@ -119,7 +123,16 @@ pub fn extract_usage(v: &serde_json::Value) -> TokenUsage {
     }
     // Thinking ("thought") tokens are billed at the output rate but reported separately.
     let thoughts = get(&["total_thought_tokens", "thoughtsTokenCount", "thoughts_token_count"]);
-    TokenUsage { input_tokens: input, output_tokens: output + thoughts }
+    // Cached prompt tokens: Gemini `cachedContentTokenCount`, OpenAI `prompt_tokens_details.cached_tokens`,
+    // Anthropic `cache_read_input_tokens` (Anthropic reports uncached and cached input separately).
+    let mut cached = get(&["cachedContentTokenCount", "cached_content_token_count", "cache_read_input_tokens"]);
+    if cached == 0 {
+        cached = u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|x| x.as_u64()).unwrap_or(0);
+    }
+    if u.contains_key("cache_read_input_tokens") {
+        input += cached + get(&["cache_creation_input_tokens"]);
+    }
+    TokenUsage { input_tokens: input, output_tokens: output + thoughts, cached_tokens: cached.min(input) }
 }
 
 pub struct Request<'a> {
@@ -129,24 +142,14 @@ pub struct Request<'a> {
     /// Speakers seen in earlier chunks, for prompt-based models.
     pub known_speakers: &'a [String],
     pub previous_text: &'a str,
+    /// Names and jargon from earlier meetings in the same folder (AI glossary), for spelling.
+    pub glossary: &'a [String],
     /// Called with a status message when waiting before a retry (e.g. rate limits).
     pub on_retry: &'a (dyn Fn(String) + Send + Sync),
     /// Set by the Cancel button; checked during requests and retry waits.
     pub cancel: &'a std::sync::atomic::AtomicBool,
 }
 
-/// Resolves once `flag` is set (polled; cheap).
-async fn cancelled(flag: &std::sync::atomic::AtomicBool) {
-    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-/// Retries for server/network errors.
-const MAX_ATTEMPTS: u32 = 6;
-/// Rate limits on long recordings are expected; keep waiting as long as the provider asks,
-/// up to this much total waiting per chunk.
-const RATE_LIMIT_BUDGET_SECS: u64 = 45 * 60;
 
 /// Whether chunks can be sent concurrently. Gemini runs sequentially so speaker
 /// context from the previous chunk can be passed along.
@@ -158,81 +161,43 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     if cfg.api_key.trim().is_empty() {
         bail!("No API key set for {}. Add one in Settings.", cfg.name);
     }
-    let mut attempt = 0;
-    let mut waited = 0u64;
     // Each time Google blocks the part, it's re-done (and any retries go) with the next model:
     // a general Gemini model → 3.5 Flash → 3.5 Transcribe.
     let mut current = cfg.clone();
     let mut blocked: Vec<(String, TokenUsage)> = Vec::new();
+    let policy = retry::RetryPolicy::default();
     loop {
-        if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            bail!("Cancelled");
-        }
-        let call = async {
-            match current.kind {
-                ProviderKind::Openai => openai_compat::transcribe(client, &current, req).await,
-                ProviderKind::Gemini => gemini::transcribe(client, &current, req).await,
-            }
-        };
+        let ctx = retry::RetryCtx { cancel: req.cancel, on_retry: req.on_retry, provider_name: &cfg.name };
+        let cur = &current;
         // Cancel stops an in-flight request too (it can take minutes for long chunks).
-        let res = tokio::select! {
-            r = call => r,
-            _ = cancelled(req.cancel) => bail!("Cancelled"),
-        };
-        let next = match &res {
-            Err(e) => e.downcast_ref::<gemini::Blocked>().and_then(|b| Some((gemini::block_fallback(&current)?, b))),
-            Ok(_) => None,
-        };
-        if let Some((model, b)) = next {
-            (req.on_retry)(format!("Google blocked this part on {} ({}) — re-doing it with {model}", current.model, b.reason));
-            blocked.push((current.model.clone(), b.usage));
-            current.model = model.to_string();
-            continue;
-        }
-        let http = res.as_ref().err().and_then(|e| e.downcast_ref::<HttpError>());
-        let rate_limited = http.is_some_and(|h| h.status == 429 && !h.daily);
-        let retry = match &res {
-            Err(_) if rate_limited => waited < RATE_LIMIT_BUDGET_SECS,
-            Err(e) => attempt + 1 < MAX_ATTEMPTS && is_retryable(e),
-            Ok(_) => false,
-        };
-        match res {
-            Err(e) if retry => {
-                attempt += 1;
-                // Honour the provider's delay (Retry-After / RetryInfo), else back off exponentially.
-                let hinted = e.downcast_ref::<HttpError>().and_then(|h| h.retry_after);
-                let wait = hinted.unwrap_or(2u64.pow(attempt.min(8))).clamp(1, 300);
-                waited += wait;
-                // Outermost context names the step, e.g. "uploading audio" / "transcribing".
-                let step = if e.chain().count() > 1 { format!(" while {e}") } else { String::new() };
-                let why = match e.downcast_ref::<HttpError>() {
-                    Some(h) if h.status == 429 => match &h.quota {
-                        Some(q) => format!("{} quota reached{step}: {q}", cfg.name),
-                        None => format!("Rate limited by {}{step}", cfg.name),
-                    },
-                    Some(h) => format!("{} returned HTTP {}", cfg.name, h.status),
-                    None => format!("Network error talking to {}", cfg.name),
-                };
-                let tries = if rate_limited { format!("waited {}m so far", waited / 60) } else { format!("attempt {}/{MAX_ATTEMPTS}", attempt + 1) };
-                (req.on_retry)(format!("{why} — retrying in {wait}s ({tries})"));
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
-                    _ = cancelled(req.cancel) => bail!("Cancelled"),
+        let res = retry::with_retry(&policy, &ctx, || async move {
+            match cur.kind {
+                ProviderKind::Openai => openai_compat::transcribe(client, cur, req).await,
+                ProviderKind::Gemini => gemini::transcribe(client, cur, req).await,
+                ProviderKind::Anthropic => bail!("{} can't transcribe audio; it's for the AI assistant only", cur.name),
+            }
+        })
+        .await;
+        if let Err(e) = &res {
+            if let Some(b) = e.downcast_ref::<gemini::Blocked>() {
+                if let Some(model) = gemini::block_fallback(&current) {
+                    (req.on_retry)(format!("Google blocked this part on {} ({}) — re-doing it with {model}", current.model, b.reason));
+                    blocked.push((current.model.clone(), b.usage));
+                    current.model = model.to_string();
+                    continue;
                 }
             }
-            other => {
-                let fallback = (!blocked.is_empty()).then(|| Fallback { model: current.model.clone(), blocked });
-                return match (other, fallback) {
-                    (Ok(t), fallback) => Ok(Transcription { segments: clamp(t.segments, req.duration), fallback, ..t }),
-                    (Err(e), Some(f)) => Err(e.context(format!(
-                        "Google blocked this part on {}, then re-doing it with {} failed",
-                        f.blocked_models(),
-                        f.model
-                    ))),
-                    (Err(e), None) => Err(e),
-                };
-            }
         }
+        let fallback = (!blocked.is_empty()).then(|| Fallback { model: current.model.clone(), blocked });
+        return match (res, fallback) {
+            (Ok(t), fallback) => Ok(Transcription { segments: clamp(t.segments, req.duration), fallback, ..t }),
+            (Err(e), Some(f)) => Err(e.context(format!(
+                "Google blocked this part on {}, then re-doing it with {} failed",
+                f.blocked_models(),
+                f.model
+            ))),
+            (Err(e), None) => Err(e),
+        };
     }
 }
 
@@ -305,12 +270,6 @@ impl std::fmt::Display for HttpError {
 }
 impl std::error::Error for HttpError {}
 
-fn is_retryable(e: &anyhow::Error) -> bool {
-    match e.downcast_ref::<HttpError>() {
-        Some(h) => (h.status == 429 && !h.daily) || h.status >= 500,
-        None => e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout() || r.is_connect()),
-    }
-}
 
 pub async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
     let status = resp.status();
@@ -358,6 +317,7 @@ pub fn parse_time(v: &serde_json::Value) -> Option<f64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn parses_time_formats() {
@@ -386,7 +346,7 @@ mod tests {
         std::fs::write(&audio, b"fake").unwrap();
         let cfg = ProviderConfig {
             id: "t".into(), name: "Test".into(), kind: ProviderKind::Openai, base_url: format!("http://{addr}"),
-            api_key: "k".into(), model: "m".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+            api_key: "k".into(), model: "m".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None, price_cached_input_per_mtok: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = cancel.clone();
@@ -395,7 +355,7 @@ mod tests {
             c2.store(true, Ordering::Relaxed);
         });
         let req = Request {
-            path: &audio, duration: 10.0, language: None, known_speakers: &[], previous_text: "",
+            path: &audio, duration: 10.0, language: None, known_speakers: &[], previous_text: "", glossary: &[],
             on_retry: &|_| {}, cancel: &cancel,
         };
         let start = std::time::Instant::now();
@@ -418,7 +378,7 @@ mod tests {
         let (_, quota, daily) = parse_google_error(&day);
         assert!(daily && quota.unwrap().starts_with("requests per day"));
         let e: anyhow::Error = HttpError { status: 429, body: day, retry_after: None, quota: Some("requests per day".into()), daily: true }.into();
-        assert!(!is_retryable(&e));
+        assert!(!retry::is_retryable(&e));
         assert!(e.to_string().contains("resumes where it stopped"));
         assert_eq!(parse_google_error("not json"), (None, None, false));
     }
@@ -427,7 +387,7 @@ mod tests {
     fn extracts_interaction_usage_fallbacks() {
         let by_mod = extract_usage(&json!({"usage": {"input_tokens_by_modality": [{"modality": "audio", "tokens": 1500}],
             "output_tokens_by_modality": [{"modality": "text", "tokens": 175}]}}));
-        assert_eq!(by_mod, TokenUsage { input_tokens: 1500, output_tokens: 175 });
+        assert_eq!(by_mod, TokenUsage { input_tokens: 1500, output_tokens: 175, cached_tokens: 0 });
         let total = extract_usage(&json!({"usage": {"total_input_tokens": 1500, "total_tokens": 1700, "total_thought_tokens": 25}}));
         assert_eq!(total.output_tokens, 200, "175 text + 25 thinking");
         // generateContent: candidates + thoughts both count as output.
@@ -441,11 +401,11 @@ mod tests {
     #[test]
     fn extracts_usage_shapes() {
         let o = extract_usage(&json!({"text": "x", "usage": {"type": "tokens", "input_tokens": 10, "output_tokens": 3}}));
-        assert_eq!(o, TokenUsage { input_tokens: 10, output_tokens: 3 });
+        assert_eq!(o, TokenUsage { input_tokens: 10, output_tokens: 3, cached_tokens: 0 });
         let g = extract_usage(&json!({"candidates": [], "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2}}));
-        assert_eq!(g, TokenUsage { input_tokens: 7, output_tokens: 2 });
+        assert_eq!(g, TokenUsage { input_tokens: 7, output_tokens: 2, cached_tokens: 0 });
         let i = extract_usage(&json!({"steps": [{"usage": {"total_input_tokens": 5, "total_output_tokens": 1}}]}));
-        assert_eq!(i, TokenUsage { input_tokens: 5, output_tokens: 1 });
+        assert_eq!(i, TokenUsage { input_tokens: 5, output_tokens: 1, cached_tokens: 0 });
         assert_eq!(extract_usage(&json!({"text": "x", "duration": 3.0})), TokenUsage::default());
         assert_eq!(extract_language(&json!({"text": "x", "language": "english"})).as_deref(), Some("english"));
         assert_eq!(extract_language(&json!({"steps": [{"language_code": "fil-PH"}]})).as_deref(), Some("fil-PH"));

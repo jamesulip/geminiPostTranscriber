@@ -140,3 +140,19 @@ html, body, #app {
   height: 100%;
   overscroll-behavior: none;
 }
+
+/* AI assistant: rendered markdown and citation chips */
+.prose-ai p { margin: 0 0 0.5rem; }
+.prose-ai p:last-child { margin-bottom: 0; }
+.prose-ai ul, .prose-ai ol { margin: 0 0 0.5rem; padding-left: 1.25rem; }
+.prose-ai ul { list-style: disc; }
+.prose-ai ol { list-style: decimal; }
+.prose-ai li { margin: 0.125rem 0; }
+.prose-ai h3, .prose-ai h4, .prose-ai h5 { margin: 0.75rem 0 0.25rem; font-weight: 600; }
+.prose-ai code { background: var(--muted); padding: 0 0.25rem; border-radius: 0.25rem; font-size: 0.85em; }
+.cite {
+  display: inline-flex; align-items: center; margin: 0 0.15rem; padding: 0 0.4rem; border-radius: 9999px;
+  background: color-mix(in oklab, var(--primary) 12%, transparent); color: var(--primary);
+  font-size: 0.72em; font-variant-numeric: tabular-nums; line-height: 1.5; vertical-align: 0.1em; cursor: pointer;
+}
+.cite:hover { background: color-mix(in oklab, var(--primary) 22%, transparent); }

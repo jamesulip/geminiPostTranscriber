@@ -244,7 +244,7 @@ pub async fn run(app: AppHandle, job: Job) {
                 model: model.clone(),
                 price_per_minute: None,
                 price_input_per_mtok: None,
-                price_output_per_mtok: None,
+                price_output_per_mtok: None, price_cached_input_per_mtok: None,
                 ..job.provider.clone()
             };
             (cfg, *sent)
@@ -262,7 +262,8 @@ pub async fn run(app: AppHandle, job: Job) {
             let _ = db::insert_usage(
                 &db,
                 &db::NewUsage {
-                    transcript_id: &job.id,
+                    kind: "transcribe",
+                    transcript_id: Some(&job.id),
                     title: &title,
                     provider: &cfg.id,
                     provider_name: &cfg.name,
@@ -288,9 +289,12 @@ pub async fn run(app: AppHandle, job: Job) {
             progress: 1.0,
             message: error.clone().unwrap_or_else(|| "Done".into()),
             done: true,
-            error,
+            error: error.clone(),
         },
     );
+    if error.is_none() {
+        crate::ai_auto_digest(&app, &job.id);
+    }
 }
 
 /// Returns `true` when the job was handed to Google as a batch (finished later by the poller).
@@ -362,6 +366,8 @@ async fn execute(
     let raw_dir = state.data_dir.join("raw").join(id);
     let _ = std::fs::remove_dir_all(&raw_dir);
     std::fs::create_dir_all(&raw_dir)?;
+    // Names/jargon from earlier meetings in this folder help the model spell them right.
+    let glossary = crate::ai::store::glossary_for_job(&state.db.lock().unwrap(), id);
     let ctx = ChunkCtx {
         client: &state.http,
         cfg: &job.provider,
@@ -373,6 +379,7 @@ async fn execute(
         raw_dir: &raw_dir,
         checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
         cancel: &job.cancel,
+        glossary: &glossary,
     };
     let notes: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let done = std::sync::atomic::AtomicUsize::new(0);
@@ -531,6 +538,7 @@ async fn execute_repair(
         meter.lock().unwrap().ratio = original_sum / processed_sum.max(0.001);
 
         let cut_points = prepared.map.boundaries();
+        let glossary = crate::ai::store::glossary_for_job(&state.db.lock().unwrap(), id);
         let ctx = ChunkCtx {
             client: &state.http,
             cfg: &job.provider,
@@ -542,6 +550,7 @@ async fn execute_repair(
             raw_dir: &raw_dir,
             checks: quality::CheckOptions { condensed: o.remove_silence, want_speakers: job.provider.diarizes() },
             cancel: &job.cancel,
+            glossary: &glossary,
         };
         let on_retry = |msg: String| emit(app, id, "transcribe", base, format!("Part {label}: {msg}"));
         let mut per_chunk = Vec::new();
@@ -637,6 +646,8 @@ pub struct ChunkCtx<'a> {
     pub checks: quality::CheckOptions,
     /// The job's Cancel flag.
     pub cancel: &'a AtomicBool,
+    /// Names/jargon from earlier meetings in the same folder, for spelling.
+    pub glossary: &'a [String],
 }
 
 /// Transcribe a chunk and check the result. On problems (skipped speech, loops, impossible timings,
@@ -658,6 +669,7 @@ pub fn transcribe_checked<'a>(
             language: ctx.language,
             known_speakers: &speakers,
             previous_text: &previous,
+            glossary: ctx.glossary,
             on_retry,
             cancel: ctx.cancel,
         };
@@ -747,7 +759,7 @@ pub fn merge(chunks: &[audio::Chunk], per_chunk: Vec<Vec<Segment>>, map: &audio:
 pub fn chunk_minutes_default(kind: &ProviderKind, s: &crate::settings::Settings) -> f64 {
     match kind {
         ProviderKind::Gemini => s.gemini_chunk_minutes,
-        ProviderKind::Openai => s.chunk_minutes,
+        ProviderKind::Openai | ProviderKind::Anthropic => s.chunk_minutes,
     }
 }
 
@@ -759,11 +771,11 @@ mod tests {
     #[test]
     fn meter_bills_blocked_attempts_and_fallbacks_separately() {
         let t = |fallback: Option<providers::Fallback>| Transcription {
-            segments: vec![], usage: TokenUsage { input_tokens: 100, output_tokens: 10 }, language: None, raw: None, fallback,
+            segments: vec![], usage: TokenUsage { input_tokens: 100, output_tokens: 10, cached_tokens: 0 }, language: None, raw: None, fallback,
         };
         let mut m = Meter::default();
         m.add("gemini-3.8-flash", 600.0, &t(None));
-        let usage = |n| TokenUsage { input_tokens: n, output_tokens: 5 };
+        let usage = |n| TokenUsage { input_tokens: n, output_tokens: 5, cached_tokens: 0 };
         let blocked = vec![("gemini-3.8-flash".to_string(), usage(90)), ("gemini-3.5-flash".to_string(), usage(80))];
         m.add("gemini-3.8-flash", 300.0, &t(Some(providers::Fallback { model: "gemini-3.5-transcribe".into(), blocked })));
         // Each blocked attempt counts as a request on its own model, without its audio.
@@ -816,7 +828,7 @@ mod tests {
         let chunk_seconds = std::env::var("MOCK_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);
         let opts = PreprocessOptions { speed: 1.25, remove_silence: true, silence_threshold_db: -35.0, silence_min_duration: 0.7, chunk_seconds, method: crate::settings::SilenceMethod::Speech, vad_threshold: 0.5 };
         let prepared = audio::preprocess(&input, &work, &opts, &|_, _| {}).await.unwrap();
-        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None };
+        let cfg = ProviderConfig { id: "mock".into(), name: "Mock".into(), kind: ProviderKind::Openai, base_url: url, api_key: "test".into(), model: "whisper-mock".into(), price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None, price_cached_input_per_mtok: None };
         let client = reqwest::Client::new();
         let meter = Mutex::new(Meter::default());
         let cut_points = prepared.map.boundaries();
@@ -826,7 +838,7 @@ mod tests {
         let ctx = ChunkCtx {
             client: &client, cfg: &cfg, language: None, condensed: &prepared.condensed, cut_points: &cut_points,
             work: &work, meter: &meter, raw_dir: &raw_dir,
-            checks: quality::CheckOptions { condensed: true, want_speakers: false }, cancel: &never,
+            checks: quality::CheckOptions { condensed: true, want_speakers: false }, cancel: &never, glossary: &[],
         };
         let on_retry = |m: String| println!("{m}");
         let mut per_chunk = vec![];

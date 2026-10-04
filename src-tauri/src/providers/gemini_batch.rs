@@ -285,10 +285,10 @@ mod tests {
         let cfg = ProviderConfig {
             id: "gemini".into(), name: "Gemini".into(), kind: crate::settings::ProviderKind::Gemini,
             base_url: std::env::var("MOCK_BATCH_URL").unwrap(), api_key: "test-key".into(), model: "gemini-3.8-flash".into(),
-            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None,
+            price_per_minute: None, price_input_per_mtok: None, price_output_per_mtok: None, price_cached_input_per_mtok: None,
         };
         let client = reqwest::Client::new();
-        let req = |k: &str| jsonl_line(k, &crate::providers::gemini::transcription_request(b"fake-audio", Some("fil"), &[], ""));
+        let req = |k: &str| jsonl_line(k, &crate::providers::gemini::transcription_request(b"fake-audio", Some("fil"), &[], "", &[]));
         let jsonl = format!("{}\n{}\n", req("chunk-0"), req("chunk-1"));
         let name = create(&client, &cfg, jsonl.into_bytes(), "test").await.unwrap();
         assert!(name.starts_with("batches/"));

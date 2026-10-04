@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Audio transcriber"
 authors = ["you"]
 edition = "2021"
+# `cargo run` / `tauri dev` build the app, not the MCP server binary.
+default-run = "transcriber"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -34,6 +36,8 @@ regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 earshot = "1.2.2"
 sherpa-onnx = "1.13.8"
+sha2 = "0.10"
+dirs = "7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keep CPU-heavy jobs on the performance cores while the window is in the background (App Nap).

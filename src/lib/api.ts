@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ProviderKind = "openai" | "gemini";
+export type ProviderKind = "openai" | "gemini" | "anthropic";
 
 export interface ProviderConfig {
   id: string;
@@ -14,6 +14,15 @@ export interface ProviderConfig {
   /** USD per 1M tokens, used when the provider reports tokens; null = built-in. */
   price_input_per_mtok: number | null;
   price_output_per_mtok: number | null;
+  /** USD per 1M prompt tokens served from the provider's cache (AI assistant); null = built-in. */
+  price_cached_input_per_mtok: number | null;
+}
+
+/** Text prices for the AI assistant (USD per 1M tokens). */
+export interface TextPrice {
+  input: number;
+  output: number;
+  cached_input: number;
 }
 
 export type SilenceMethod = "speech" | "volume";
@@ -21,6 +30,22 @@ export type SilenceMethod = "speech" | "volume";
 /** Whether a provider/model returns speaker labels. */
 export function diarizes(p: ProviderConfig | undefined): boolean {
   return !!p && (p.kind === "gemini" || p.model.includes("diarize"));
+}
+
+/** Whether a provider can transcribe audio (Anthropic is text-only, for the assistant). */
+export function transcribes(p: ProviderConfig | undefined): boolean {
+  return !!p && p.kind !== "anthropic";
+}
+
+export const PROVIDER_KIND_LABEL: Record<ProviderKind, string> = {
+  openai: "OpenAI-compatible",
+  gemini: "Gemini",
+  anthropic: "Anthropic",
+};
+
+/** Default chat model when a provider is picked for the assistant. */
+export function defaultChatModel(kind: ProviderKind): string {
+  return kind === "gemini" ? "gemini-3.8-flash" : kind === "anthropic" ? "claude-opus-5-5" : "gpt-4o-mini";
 }
 
 export interface Settings {
@@ -38,6 +63,17 @@ export interface Settings {
   batch_chunk_minutes: number;
   /** Re-do batch parts Google blocked/left empty right away with the speaker-label provider. */
   batch_retry_failed: boolean;
+  /** AI assistant: provider id and chat model for questions and summaries. */
+  ai_provider: string;
+  ai_model: string;
+  /** Embeddings (semantic search). Anthropic has none. */
+  ai_embedding_provider: string;
+  ai_embedding_model: string;
+  /** Summarise each transcript when it finishes. */
+  ai_auto_digest: boolean;
+  /** Keep a whole transcript in the provider's prompt cache while asking several questions. */
+  ai_context_cache: boolean;
+  ai_context_cache_ttl_minutes: number;
   remove_silence: boolean;
   silence_method: SilenceMethod;
   vad_threshold: number;
@@ -90,6 +126,8 @@ export interface TranscriptSummary {
   flagged: boolean;
   /** Set while the transcript is in the trash. */
   trashed_at: string | null;
+  /** Identity of the current text; AI summaries compare against it to show staleness. */
+  content_hash: string | null;
 }
 
 /** An archived (non-current) transcription. */
@@ -134,14 +172,18 @@ export interface UsageTotals {
   saved_usd: number;
 }
 
+export type UsageKind = "transcribe" | "ai" | "embed";
+
 export interface UsageGroup extends UsageTotals {
   month: string;
+  kind: UsageKind;
   provider_name: string;
   model: string;
 }
 
 export interface UsageRow {
   id: number;
+  kind: UsageKind;
   transcript_id: string | null;
   title: string;
   provider_name: string;
@@ -160,6 +202,7 @@ export interface UsageRow {
 export interface UsageSummary {
   all_time: UsageTotals;
   this_month: UsageTotals;
+  by_kind: ({ kind: UsageKind } & UsageTotals)[];
   by_month: UsageGroup[];
   recent: UsageRow[];
 }
@@ -255,6 +298,94 @@ export interface AudioLevels {
 
 export type ExportFormat = "txt" | "md" | "srt" | "vtt" | "json";
 
+// AI assistant ---------------------------------------------------------------------
+
+/** What a question or search is about. */
+export type Scope = { kind: "transcript"; id: string } | { kind: "folder"; id: number } | { kind: "tag"; id: number } | { kind: "library" };
+
+export type DigestKind = "summary" | "decisions" | "actions" | "questions" | "topics" | "glossary" | "speakers" | "translation_en" | "brief";
+
+export interface Digest {
+  kind: DigestKind | string;
+  content_hash: string;
+  prompt_version: number;
+  model: string;
+  /** Markdown (summary, brief, translation) or a JSON array (lists). */
+  content: string;
+  created_at: string;
+  /** The transcript changed since this was made. */
+  stale: boolean;
+}
+
+export interface AiThread {
+  id: string;
+  title: string;
+  scope: Scope;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Citation {
+  transcript_id: string;
+  title: string;
+  start: number;
+}
+
+export interface AiMessage {
+  id: number;
+  thread_id: string;
+  role: "user" | "assistant";
+  /** Markdown; answers carry `[[t:<transcript id>:<seconds>]]` citation tokens. */
+  content: string;
+  citations: Citation[];
+  model: string | null;
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  created_at: string;
+  from_memo: boolean;
+}
+
+export interface AiHit {
+  chunk_id: number;
+  transcript_id: string;
+  title: string;
+  idx: number;
+  start: number;
+  end: number;
+  text: string;
+  score: number;
+  via: "words" | "meaning" | "both";
+  /** Best time to seek to. */
+  at: number;
+}
+
+export interface Retrieval {
+  hits: AiHit[];
+  note: string | null;
+}
+
+export type AiEvent =
+  | { type: "token"; thread_id: string; delta: string }
+  | { type: "progress"; key: string; message: string; progress: number; done: boolean; error: string | null };
+
+export interface AiAnswerEvent {
+  thread_id: string;
+  thread?: AiThread;
+  message?: AiMessage;
+  note?: string | null;
+  error: string | null;
+}
+
+export interface AskParams {
+  thread_id: string | null;
+  scope: Scope;
+  question: string;
+  /** Put the whole transcript in context even when it's long. */
+  read_all: boolean;
+}
+
 export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
@@ -299,8 +430,27 @@ export const api = {
   deleteVersion: (versionId: number) => invoke<void>("delete_version", { versionId }),
 
   usageSummary: () => invoke<UsageSummary>("usage_summary"),
+  // AI assistant
+  aiDigest: (id: string, force = false) => invoke<void>("ai_digest", { id, force }),
+  aiGetDigests: (id: string) => invoke<Digest[]>("ai_get_digests", { id }),
+  aiRunning: () => invoke<string[]>("ai_running"),
+  aiCancel: (key: string) => invoke<void>("ai_cancel", { key }),
+  /** Returns the thread id; tokens arrive on `ai-event`, the final message on `ai-answer`. */
+  aiAsk: (params: AskParams) => invoke<string>("ai_ask", { params }),
+  aiListThreads: (scope: Scope | null = null) => invoke<AiThread[]>("ai_list_threads", { scope }),
+  aiGetThread: (id: string) => invoke<{ thread: AiThread; messages: AiMessage[] } | null>("ai_get_thread", { id }),
+  aiDeleteThread: (id: string) => invoke<void>("ai_delete_thread", { id }),
+  aiSearch: (query: string, scope: Scope, limit = 20) => invoke<Retrieval>("ai_search", { query, scope, limit }),
+  aiEmbedLibrary: () => invoke<void>("ai_embed_library"),
+  aiTestConnection: (providerId: string, model: string) => invoke<string>("ai_test_connection", { providerId, model }),
+  /** Markdown project brief with citations for a scope (takes ~30 s). */
+  aiBrief: (scope: Scope) => invoke<string>("ai_brief", { scope }),
+  /** Translate to English in the background; result arrives as the `translation_en` digest. */
+  aiTranslate: (id: string, force = false) => invoke<void>("ai_translate", { id, force }),
+  saveText: (path: string, text: string) => invoke<void>("save_text", { path, text }),
+
   knownPrice: (model: string) =>
-    invoke<{ per_minute: number; tokens: [number, number] | null }>("known_price", { model }),
+    invoke<{ per_minute: number; tokens: [number, number] | null; text: TextPrice | null }>("known_price", { model }),
 
   listFolders: () => invoke<Folder[]>("list_folders"),
   createFolder: (name: string, parentId: number | null) => invoke<Folder>("create_folder", { name, parentId }),
