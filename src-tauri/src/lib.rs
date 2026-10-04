@@ -1,4 +1,5 @@
 pub mod ai;
+mod align;
 mod audio;
 mod batch;
 pub mod db;
@@ -83,8 +84,22 @@ pub(crate) fn spawn_job_with(
     id: String,
     source: Option<PathBuf>,
     audio_path: PathBuf,
+    opts: jobs::JobOptions,
+    repair: Option<Vec<audio::Interval>>,
+) -> CmdResult<()> {
+    spawn(app, state, id, source, audio_path, opts, repair, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn(
+    app: &AppHandle,
+    state: &AppState,
+    id: String,
+    source: Option<PathBuf>,
+    audio_path: PathBuf,
     mut opts: jobs::JobOptions,
     repair: Option<Vec<audio::Interval>>,
+    align: bool,
 ) -> CmdResult<()> {
     let s = settings::load(&state.settings_path());
     let mut provider = s
@@ -101,14 +116,14 @@ pub(crate) fn spawn_job_with(
         return Err("Overnight batch needs a general Gemini model such as gemini-3.8-flash (Gemini 3.5 Transcribe has no batch mode).".into());
     }
     // Repairs reuse the last full run's options; only full runs define them (and its chunk cache).
-    if repair.is_none() {
+    if repair.is_none() && !align {
         if let Ok(json) = serde_json::to_string(&opts) {
             let _ = db::set_last_options(&state.db.lock().unwrap(), &id, &json);
         }
     }
     let cancel = Arc::new(AtomicBool::new(false));
     state.cancels.lock().unwrap().insert(id.clone(), cancel.clone());
-    let job = jobs::Job { id, source, audio_path, provider, opts, cancel, repair };
+    let job = jobs::Job { id, source, audio_path, provider, opts, cancel, repair, align };
     tauri::async_runtime::spawn(jobs::run(app.clone(), job));
     Ok(())
 }
@@ -317,6 +332,35 @@ fn repair_transcript(
     spawn_job_with(&app, &state, id, None, audio_path, options, Some(ranges))
 }
 
+/// Re-time the current version's lines against word timings from a Whisper-style provider (for
+/// models whose own timestamps drift, like Gemini Flash). Text and speakers stay as they are.
+#[tauri::command]
+fn fix_timestamps(app: AppHandle, state: State<AppState>, id: String, mut options: jobs::JobOptions) -> CmdResult<()> {
+    let s = settings::load(&state.settings_path());
+    let provider = s.providers.iter().find(|p| p.id == options.provider_id).ok_or("Unknown provider")?;
+    if provider.kind != settings::ProviderKind::Openai {
+        return Err(format!("{} can't time words; pick a Whisper provider such as Groq", provider.name));
+    }
+    if state.cancels.lock().unwrap().contains_key(&id) {
+        return Err("A job is already running for this transcript".into());
+    }
+    let audio_path = {
+        let db = state.db.lock().unwrap();
+        let t = db::get_transcript(&db, &id).map_err(err)?.ok_or("Transcript not found")?;
+        if t.segments.is_empty() {
+            return Err("There are no lines to re-time".into());
+        }
+        db::set_status(&db, &id, "processing", None).map_err(err)?;
+        PathBuf::from(t.audio_path)
+    };
+    options.batch = false;
+    let res = spawn(&app, &state, id.clone(), None, audio_path, options, None, true);
+    if res.is_err() {
+        let _ = db::set_status(&state.db.lock().unwrap(), &id, "done", None);
+    }
+    res
+}
+
 /// Latest progress of every running job.
 #[tauri::command]
 fn job_progress(state: State<AppState>) -> Vec<jobs::Progress> {
@@ -447,6 +491,12 @@ fn set_flagged(state: State<AppState>, id: String, flagged: bool) -> CmdResult<(
 #[tauri::command]
 fn rename_speaker(state: State<AppState>, id: String, label: String, name: String) -> CmdResult<()> {
     db::rename_speaker(&state.db.lock().unwrap(), &id, &label, &name).map_err(err)
+}
+
+/// Merge speakers that turned out to be the same person; returns the archived version (for undo).
+#[tauri::command]
+fn merge_speakers(state: State<AppState>, id: String, from: Vec<String>, into: String, name: Option<String>) -> CmdResult<i64> {
+    db::merge_speakers(&mut state.db.lock().unwrap(), &id, &from, &into, name.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -830,6 +880,8 @@ pub fn run() {
             empty_trash,
             set_flagged,
             rename_speaker,
+            merge_speakers,
+            fix_timestamps,
             update_segment,
             search,
             export_transcript,

@@ -1,10 +1,10 @@
 //! Background transcription jobs: preprocess → transcribe chunks → map times → store.
 
 use crate::audio::{self, PreprocessOptions};
-use crate::providers::{self, Request, Segment, TokenUsage, Transcription};
+use crate::providers::{self, Request, Segment, TokenUsage, Transcription, Word};
 use crate::settings::{ProviderConfig, ProviderKind};
-use crate::{db, quality, AppState};
-use anyhow::{bail, Result};
+use crate::{align, db, quality, AppState};
+use anyhow::{anyhow, bail, Result};
 use futures::future::{BoxFuture, FutureExt};
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,8 @@ pub struct Job {
     pub cancel: Arc<AtomicBool>,
     /// Re-transcribe only these stretches (original time) and splice them into the current version.
     pub repair: Option<Vec<audio::Interval>>,
+    /// Only re-time the current version's lines against the provider's word timings.
+    pub align: bool,
 }
 
 pub fn emit(app: &AppHandle, id: &str, stage: &str, progress: f64, message: impl Into<String>) {
@@ -144,7 +146,9 @@ impl ChunkCache {
     fn new(cache_dir: &std::path::Path, job: &Job) -> Self {
         let lang = job.opts.language.as_deref().unwrap_or("");
         let legacy = [lang, ""].iter().map(|l| Self::hash(job, Some(l))).collect();
-        ChunkCache { dir: cache_dir.join("results").join(&job.id), key: Self::hash(job, None), legacy }
+        // Re-timing keeps its own results, so finishing it doesn't drop a failed transcription's.
+        let dir = if job.align { format!("{}-align", job.id) } else { job.id.clone() };
+        ChunkCache { dir: cache_dir.join("results").join(dir), key: Self::hash(job, None), legacy }
     }
 
     /// Only what changes the audio sent or the model matters; the language is just a hint, so
@@ -198,7 +202,12 @@ pub async fn run(app: AppHandle, job: Job) {
     let work = state.cache_dir.join("jobs").join(&job.id);
     let meter = Mutex::new(Meter::default());
     let cache = ChunkCache::new(&state.cache_dir, &job);
+    let mut summary: Option<String> = None;
     let result = match &job.repair {
+        _ if job.align => execute_align(&app, &job, &work, &meter, &cache).await.map(|s| {
+            summary = Some(s);
+            false
+        }),
         Some(ranges) => execute_repair(&app, &job, &work, &meter, ranges).await.map(|_| false),
         None => execute(&app, &job, &work, &meter, &cache).await,
     };
@@ -221,17 +230,23 @@ pub async fn run(app: AppHandle, job: Job) {
         return;
     }
     let _ = std::fs::remove_dir_all(&work);
-    if result.is_ok() {
+    // Word timings are kept, so fixing the timestamps again (e.g. after editing lines) is free.
+    if result.is_ok() && !job.align {
         cache.clear();
     }
     state.cancels.lock().unwrap().remove(&job.id);
     state.progress.lock().unwrap().remove(&job.id);
 
-    let error = result.err().map(|e| format!("{e:#}"));
+    let error = result.err().map(|e| match format!("{e:#}") {
+        e if job.align && e != "Cancelled" => format!("Fixing timestamps failed: {e}"),
+        e => e,
+    });
+    // On the transcript, say which job it was (the UI offers to run that job again).
+    let stored = error.as_ref().map(|e| if job.align && e == "Cancelled" { "Fixing timestamps failed: Cancelled".to_string() } else { e.clone() });
     {
         let db = state.db.lock().unwrap();
         let status = if error.is_some() { "error" } else { "done" };
-        let _ = match &error {
+        let _ = match &stored {
             // Keeps the transcript usable when a re-transcription fails and a previous version exists.
             Some(e) => db::mark_failed(&db, &job.id, e),
             None => db::set_status(&db, &job.id, "done", None),
@@ -285,14 +300,15 @@ pub async fn run(app: AppHandle, job: Job) {
         "job-progress",
         Progress {
             id: job.id.clone(),
-            stage: if error.is_some() { "error".into() } else { "done".into() },
+            stage: if error.is_some() { "error".into() } else if job.align { "align".into() } else { "done".into() },
             progress: 1.0,
-            message: error.clone().unwrap_or_else(|| "Done".into()),
+            message: error.clone().or(summary).unwrap_or_else(|| "Done".into()),
             done: true,
             error: error.clone(),
         },
     );
-    if error.is_none() {
+    // Re-timing doesn't change what was said: the summary is refreshed when it's next opened.
+    if error.is_none() && !job.align {
         crate::ai_auto_digest(&app, &job.id);
     }
 }
@@ -601,6 +617,118 @@ async fn execute_repair(
     Ok(())
 }
 
+/// Re-time the current version's lines against word timings from `job.provider` (a Whisper-style
+/// API): text and speakers stay, only start/end move. Returns a summary for the user.
+async fn execute_align(
+    app: &AppHandle,
+    job: &Job,
+    work: &std::path::Path,
+    meter: &Mutex<Meter>,
+    cache: &ChunkCache,
+) -> Result<String> {
+    let state = app.state::<AppState>();
+    let id = job.id.as_str();
+    let (lines, hash, duration) = {
+        let db = state.db.lock().unwrap();
+        let t = db::get_transcript(&db, id)?.ok_or_else(|| anyhow!("Transcript not found"))?;
+        let hash = db::content_hash(&t.segments);
+        (t.segments, hash, t.summary.duration)
+    };
+    if lines.is_empty() {
+        bail!("There are no lines to re-time");
+    }
+
+    emit(app, id, "align", 0.02, "Preparing audio");
+    let on_progress = |msg: &str, f: f64| emit(app, id, "align", 0.02 + 0.08 * f, msg);
+    let prepared = audio::preprocess(&job.audio_path, work, &preprocess_options(&job.opts), &on_progress).await?;
+    meter.lock().unwrap().ratio = prepared.original_duration / prepared.processed_duration.max(0.001);
+    let raw_dir = state.data_dir.join("raw").join(id).join("align");
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    std::fs::create_dir_all(&raw_dir)?;
+    let language = job.opts.language.as_deref().filter(|l| !l.trim().is_empty());
+    let n = prepared.chunks.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let progress_now = || 0.1 + 0.85 * (done.load(Ordering::Relaxed) as f64 / n as f64);
+    emit(app, id, "align", 0.1, format!("Timing the words with {} ({n} part(s))", job.provider.model));
+
+    let run_chunk = |i: usize, chunk: audio::Chunk| {
+        let (state, prepared, raw_dir, done, progress_now) = (&state, &prepared, &raw_dir, &done, &progress_now);
+        async move {
+            if job.cancel.load(Ordering::Relaxed) {
+                bail!("Cancelled");
+            }
+            let t = match cache.get(i, &chunk) {
+                Some(t) => t,
+                None => {
+                    let on_retry = |msg: String| emit(app, id, "align", progress_now(), msg);
+                    let req = Request {
+                        path: &chunk.path,
+                        duration: chunk.duration,
+                        language,
+                        known_speakers: &[],
+                        previous_text: "",
+                        glossary: &[],
+                        on_retry: &on_retry,
+                        cancel: &job.cancel,
+                        word_timestamps: true,
+                    };
+                    let mut t = providers::transcribe(&state.http, &job.provider, &req).await?;
+                    meter.lock().unwrap().add(&job.provider.model, chunk.duration, &t);
+                    if let Some(raw) = t.raw.take() {
+                        let _ = std::fs::write(raw_dir.join(format!("chunk-{}.json", i + 1)), raw.to_string());
+                    }
+                    cache.put(i, &chunk, &t);
+                    t
+                }
+            };
+            let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+            emit(app, id, "align", progress_now(), format!("Timed {k}/{n} part(s)"));
+            let words = align::reference_words(t.segments, t.words);
+            // Word by word into original time: a sentence can span silence that was cut out.
+            Ok::<_, anyhow::Error>(
+                words
+                    .into_iter()
+                    .map(|w| Word {
+                        start: prepared.map.to_original(chunk.offset + w.start),
+                        end: prepared.map.to_original_end(chunk.offset + w.end),
+                        text: w.text,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let parallel = if providers::parallel(&job.provider) { 3 } else { 1 };
+    let futs: Vec<_> = prepared.chunks.iter().cloned().enumerate().map(|(i, c)| run_chunk(i, c)).collect();
+    let per_chunk: Vec<Vec<Word>> = futures::stream::iter(futs).buffered(parallel).try_collect().await?;
+    let words: Vec<Word> = per_chunk.into_iter().flatten().collect();
+    if words.is_empty() {
+        bail!("{} heard no speech", job.provider.model);
+    }
+    // The reference in original time, for diagnosing an alignment offline (see align.rs tests).
+    if let Ok(json) = serde_json::to_string(&words) {
+        let _ = std::fs::write(raw_dir.join("words.json"), json);
+    }
+
+    emit(app, id, "align", 0.97, "Matching the lines to the audio");
+    let a = align::align(&lines, &words, duration.max(prepared.original_duration));
+    let share = a.matched as f64 / lines.len() as f64;
+    if share < 0.4 {
+        bail!(
+            "only {:.0}% of the lines matched what {} heard, too few to trust, so the timestamps were left as they were",
+            share * 100.0,
+            job.provider.model
+        );
+    }
+    let timings: Vec<(i64, f64, f64)> = a.timings.iter().map(|t| (t.id, t.start, t.end)).collect();
+    db::apply_timings(&mut state.db.lock().unwrap(), id, &timings, &hash)?;
+    Ok(if a.moved == 0 {
+        "the timestamps were already right".into()
+    } else {
+        let most = if a.max_shift < 60.0 { format!("{:.0} s", a.max_shift) } else { crate::export::clock(a.max_shift) };
+        format!("moved {} of {} lines, by up to {most}", a.moved, lines.len())
+    })
+}
+
 /// Old segments outside `ranges` (minus impossible multi-minute "lines") + the new ones, sorted,
 /// with loops removed.
 pub fn splice(old: &[db::SegmentRow], ranges: &[audio::Interval], new: Vec<Segment>) -> Vec<Segment> {
@@ -672,6 +800,7 @@ pub fn transcribe_checked<'a>(
             glossary: ctx.glossary,
             on_retry,
             cancel: ctx.cancel,
+            word_timestamps: false,
         };
         let mut t = providers::transcribe(ctx.client, ctx.cfg, &req).await?;
         ctx.meter.lock().unwrap().add(&ctx.cfg.model, chunk.duration, &t);
@@ -716,7 +845,7 @@ pub fn transcribe_checked<'a>(
         segments.extend(tb.segments.into_iter().map(|s| Segment { start: s.start + shift, end: s.end + shift, ..s }));
         let mut usage = ta.usage;
         usage += tb.usage;
-        Ok((Transcription { segments, usage, language: ta.language.or(tb.language), raw: None, fallback: None }, notes))
+        Ok((Transcription { segments, usage, language: ta.language.or(tb.language), raw: None, fallback: None, words: vec![] }, notes))
     }
     .boxed()
 }
@@ -771,7 +900,7 @@ mod tests {
     #[test]
     fn meter_bills_blocked_attempts_and_fallbacks_separately() {
         let t = |fallback: Option<providers::Fallback>| Transcription {
-            segments: vec![], usage: TokenUsage { input_tokens: 100, output_tokens: 10, cached_tokens: 0 }, language: None, raw: None, fallback,
+            segments: vec![], usage: TokenUsage { input_tokens: 100, output_tokens: 10, cached_tokens: 0 }, language: None, raw: None, fallback, words: vec![],
         };
         let mut m = Meter::default();
         m.add("gemini-3.8-flash", 600.0, &t(None));

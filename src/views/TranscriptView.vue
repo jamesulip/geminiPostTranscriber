@@ -6,8 +6,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
-  AlertCircle, AlertTriangle, ArrowLeft, Check, Download, GitCompare, History, Loader2, LocateFixed, MoreHorizontal, Pause,
-  Flag, Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, UserSearch, Users, Wrench,
+  AlertCircle, AlertTriangle, ArrowLeft, Check, Clock, Download, GitCompare, History, Loader2, LocateFixed, MoreHorizontal, Pause,
+  Flag, Merge, Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, UserSearch, Users, Wrench,
 } from "@lucide/vue";
 import ConfirmDialog from "@/components/ConfirmDialog.vue";
 import { Button } from "@/components/ui/button";
@@ -23,6 +23,8 @@ import TagPicker from "@/components/TagPicker.vue";
 import SpeakerTimeline from "@/components/SpeakerTimeline.vue";
 import LevelMeter from "@/components/LevelMeter.vue";
 import SpeakerIdDialog from "@/components/SpeakerIdDialog.vue";
+import MergeSpeakersDialog from "@/components/MergeSpeakersDialog.vue";
+import FixTimestampsDialog from "@/components/FixTimestampsDialog.vue";
 import DiarizeDialog from "@/components/DiarizeDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
@@ -94,6 +96,30 @@ const busy = computed(() => t.value?.status === "processing" || t.value?.status 
 function openIdentify() {
   audio.value?.pause();
   identifying.value = true;
+}
+
+/** Merge-speakers dialog, optionally opened with one speaker ticked. */
+const merging = ref<{ initial: string | null } | null>(null);
+/** A running diarization or clean-up would overwrite the merge when it finishes. */
+const canMergeSpeakers = computed(() => speakerOrder.value.length >= 2 && !readOnly.value && !busy.value && !cleaning.value);
+
+async function onMerged(versionId: number, summary: string) {
+  merging.value = null;
+  await load();
+  toast.success(summary, {
+    description: "The labels from before are kept in the transcription history.",
+    duration: 8000,
+    action: { label: "Undo", onClick: () => void undoMerge(versionId) },
+  });
+}
+
+async function undoMerge(versionId: number) {
+  try {
+    await api.restoreVersion(versionId);
+    await load();
+  } catch (e) {
+    toast.error("Couldn't undo the merge", { description: String(e) });
+  }
 }
 const ai = useAi();
 
@@ -181,6 +207,15 @@ async function checkNow() {
 async function openFix() {
   await settingsStore.load();
   fixing.value = true;
+}
+
+const retiming = ref(false);
+/** The last Fix timestamps run failed (Retry runs that again, not a re-transcription). */
+const retimeFailed = computed(() => !!t.value?.error?.startsWith("Fixing timestamps failed"));
+async function openRetime() {
+  await settingsStore.load();
+  identifying.value = false;
+  retiming.value = true;
 }
 
 /** Versions in the compare dialog: an archived version id, or "current". */
@@ -590,7 +625,11 @@ const saved = computed(() =>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued' || !t.segments.length || !!viewing" @click="openFix">
             <Wrench /> Fix problems…
           </DropdownMenuItem>
+          <DropdownMenuItem :disabled="busy || !t.segments.length || !!viewing" @click="openRetime">
+            <Clock /> Fix timestamps…
+          </DropdownMenuItem>
           <DropdownMenuItem :disabled="!speakerOrder.length || readOnly" @click="openIdentify"><Users /> Identify speakers…</DropdownMenuItem>
+          <DropdownMenuItem :disabled="!canMergeSpeakers" @click="merging = { initial: null }"><Merge /> Merge speakers…</DropdownMenuItem>
           <DropdownMenuItem :disabled="busy || !t.segments.length || !!viewing" @click="diarizing = true"><UserSearch /> Find speakers on this Mac…</DropdownMenuItem>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
           <DropdownMenuItem v-if="t.status === 'processing' || t.status === 'queued'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
@@ -660,8 +699,9 @@ const saved = computed(() =>
       class="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm dark:border-amber-900 dark:bg-amber-950/40"
     >
       <AlertTriangle class="size-4 shrink-0 text-amber-600" />
-      <span class="min-w-0 truncate" :title="t.error">Last re-transcription failed — still showing v{{ t.version }}. {{ t.error }}</span>
-      <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="openRetry"><RefreshCw /> Retry</Button>
+      <span v-if="retimeFailed" class="min-w-0 truncate" :title="t.error">{{ t.error }}. The timestamps weren't changed.</span>
+      <span v-else class="min-w-0 truncate" :title="t.error">Last re-transcription failed — still showing v{{ t.version }}. {{ t.error }}</span>
+      <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="retimeFailed ? openRetime() : openRetry()"><RefreshCw /> Retry</Button>
     </div>
 
     <div v-if="cleaning" class="flex items-center gap-3 border-b px-6 py-2 text-sm">
@@ -846,6 +886,14 @@ const saved = computed(() =>
             title="Find who spoke when with the local diarizer (no API needed)"
             @click="diarizing = true"
           ><UserSearch /> Find speakers…</Button>
+          <Button
+            v-if="speakerOrder.length >= 2 && !readOnly"
+            variant="outline"
+            size="sm"
+            title="Merge speakers who are the same person"
+            :disabled="!canMergeSpeakers"
+            @click="merging = { initial: null }"
+          ><Merge /> Merge…</Button>
         </div>
       </div>
 
@@ -908,6 +956,11 @@ const saved = computed(() =>
           class="hover:bg-accent w-full rounded-md px-2 py-1.5 text-left"
           @click="(renaming = speakerMenu.seg.speaker), (speakerMenu = null)"
         >Rename “{{ speakerName(speakerMenu.seg.speaker) }}”…</button>
+        <button
+          v-if="canMergeSpeakers"
+          class="hover:bg-accent w-full rounded-md px-2 py-1.5 text-left"
+          @click="(merging = { initial: speakerMenu.seg.speaker }), (speakerMenu = null)"
+        >Merge “{{ speakerName(speakerMenu.seg.speaker) }}” with…</button>
       </template>
     </div>
 
@@ -948,8 +1001,30 @@ const saved = computed(() =>
       :speaker-order="speakerOrder"
       :names="names"
       :src="src"
+      :can-merge="canMergeSpeakers"
+      :can-retime="!busy"
       @close="identifying = false"
-      @saved="(identifying = false), load()"
+      @fix-timestamps="openRetime"
+      @saved="(m) => ((identifying = false), m ? onMerged(m.versionId, m.summary) : load())"
+    />
+
+    <FixTimestampsDialog
+      v-if="retiming && settingsStore.settings"
+      :t="t"
+      :settings="settingsStore.settings"
+      @close="retiming = false"
+      @started="(retiming = false), load(), library.refresh()"
+    />
+
+    <MergeSpeakersDialog
+      v-if="merging"
+      :transcript-id="t.id"
+      :segments="segments"
+      :speaker-order="speakerOrder"
+      :names="names"
+      :initial="merging.initial"
+      @close="merging = null"
+      @merged="onMerged"
     />
 
     <DiarizeDialog

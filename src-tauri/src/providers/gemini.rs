@@ -156,7 +156,7 @@ async fn interact(
             .await?;
         v = check(r).await?.json().await?;
     }
-    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v), raw: Some(v), fallback: None })
+    Ok(Transcription { segments: parse_interaction(&v, req.duration), usage: extract_usage(&v), language: extract_language(&v), raw: Some(v), fallback: None, words: vec![] })
 }
 
 #[derive(Debug)]
@@ -378,6 +378,7 @@ pub fn parse_generate_response(v: &Value) -> Result<Transcription> {
         language: None,
         raw: Some(v.clone()),
         fallback: None,
+        words: vec![],
     })
 }
 
@@ -499,7 +500,7 @@ mod tests {
         let messages = std::sync::Mutex::new(Vec::new());
         let on_retry = |m: String| messages.lock().unwrap().push(m);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let req = Request { path: &path, duration: 60.0, language: Some("fil"), known_speakers: &[], previous_text: "", glossary: &[], on_retry: &on_retry, cancel: &cancel };
+        let req = Request { path: &path, duration: 60.0, language: Some("fil"), known_speakers: &[], previous_text: "", glossary: &[], on_retry: &on_retry, cancel: &cancel, word_timestamps: false };
         let client = reqwest::Client::new();
         let at = |prefix: &str, model: &str| ProviderConfig { base_url: format!("{}{prefix}", cfg.base_url), model: model.into(), ..cfg.clone() };
         let blocked_on = |f: &crate::providers::Fallback| f.blocked.iter().map(|(m, u)| (m.clone(), u.input_tokens)).collect::<Vec<_>>();

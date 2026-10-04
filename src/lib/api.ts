@@ -418,6 +418,8 @@ export const api = {
   speechInGaps: (id: string, gaps: [number, number][]) => invoke<number[]>("speech_in_gaps", { id, gaps }),
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),
+  /** Re-time the lines against a Whisper provider's word timings; progress arrives as an "align" job. */
+  fixTimestamps: (id: string, options: JobOptions) => invoke<void>("fix_timestamps", { id, options }),
   cancelJob: (id: string) => invoke<void>("cancel_job", { id }),
   jobProgress: () => invoke<Progress[]>("job_progress"),
   checkBatches: () => invoke<void>("check_batches"),
@@ -433,6 +435,9 @@ export const api = {
   emptyTrash: () => invoke<void>("empty_trash"),
   setFlagged: (id: string, flagged: boolean) => invoke<void>("set_flagged", { id, flagged }),
   renameSpeaker: (id: string, label: string, name: string) => invoke<void>("rename_speaker", { id, label, name }),
+  /** Relabel the `from` speakers as `into` (optionally renaming it); returns the archived version's id. */
+  mergeSpeakers: (id: string, from: string[], into: string, name: string | null) =>
+    invoke<number>("merge_speakers", { id, from, into, name }),
   updateSegment: (segmentId: number, text: string, speaker: string | null) =>
     invoke<void>("update_segment", { segmentId, text, speaker }),
   search: (query: string) => invoke<SearchHit[]>("search", { query }),

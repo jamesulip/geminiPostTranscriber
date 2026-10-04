@@ -1,6 +1,6 @@
 //! OpenAI-compatible `/audio/transcriptions` (OpenAI, Groq, local servers, ...).
 
-use super::{check, extract_language, extract_usage, parse_time, Request, Segment, Transcription};
+use super::{check, extract_language, extract_usage, parse_time, Request, Segment, Transcription, Word};
 use crate::settings::ProviderConfig;
 use anyhow::{Context, Result};
 use reqwest::multipart::{Form, Part};
@@ -21,6 +21,9 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     } else {
         form.text("response_format", "verbose_json").text("timestamp_granularities[]", "segment")
     };
+    if req.word_timestamps && !plain && !diarize {
+        form = form.text("timestamp_granularities[]", "word");
+    }
     if let Some(lang) = req.language.and_then(whisper_language) {
         form = form.text("language", lang);
     }
@@ -41,7 +44,26 @@ pub async fn transcribe(client: &reqwest::Client, cfg: &ProviderConfig, req: &Re
     let url = format!("{}/audio/transcriptions", cfg.base_url.trim_end_matches('/'));
     let resp = client.post(url).bearer_auth(&cfg.api_key).multipart(form).send().await?;
     let body: Value = check(resp).await.context("transcribing")?.json().await.context("invalid JSON from provider")?;
-    Ok(Transcription { segments: parse(&body, req.duration), usage: extract_usage(&body), language: extract_language(&body), raw: Some(body), fallback: None })
+    Ok(Transcription {
+        segments: parse(&body, req.duration),
+        usage: extract_usage(&body),
+        language: extract_language(&body),
+        words: parse_words(&body),
+        raw: Some(body),
+        fallback: None,
+    })
+}
+
+/// `words: [{word, start, end}]` from `timestamp_granularities[]=word`.
+fn parse_words(body: &Value) -> Vec<Word> {
+    let Some(words) = body.get("words").and_then(Value::as_array) else { return vec![] };
+    words
+        .iter()
+        .filter_map(|w| {
+            Some(Word { start: parse_time(w.get("start")?)?, end: parse_time(w.get("end")?)?, text: w.get("word")?.as_str()?.trim().to_string() })
+        })
+        .filter(|w| !w.text.is_empty())
+        .collect()
 }
 
 /// Whisper-style APIs only accept ISO 639-1 codes ("tl", "en"); Gemini accepts others ("fil").
@@ -108,6 +130,13 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].start, 1.2);
         assert_eq!(s[0].speaker, None);
+    }
+
+    #[test]
+    fn parses_words() {
+        let w = parse_words(&json!({"words": [{"word": " yung", "start": 0.12, "end": 0.28}, {"word": "x"}]}));
+        assert_eq!(w, vec![Word { start: 0.12, end: 0.28, text: "yung".into() }]);
+        assert!(parse_words(&json!({"text": "hi"})).is_empty());
     }
 
     #[test]

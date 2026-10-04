@@ -9,7 +9,9 @@ Groq / OpenAI (any OpenAI-compatible `/audio/transcriptions` API) or Gemini.
 - Chunking at silence boundaries; timestamps are mapped back to the **original** audio.
 - Speaker diarization with Gemini `gemini-3.5-transcribe` (Interactions API) or OpenAI `gpt-4o-transcribe-diarize`.
 - Library grouped by nested **folders** and **tags**.
-- Transcript view: audio player, speaker timeline, click-to-seek, rename/reassign speakers, edit segments.
+- Transcript view: audio player, speaker timeline, click-to-seek, rename/reassign/merge speakers, edit segments.
+- Fix timestamps (⋯ menu): Gemini Flash writes its own timestamps and drifts by up to a minute; this re-times every
+  line against Whisper word timings (Groq, ~$0.02/hour of audio), keeping the text and speakers.
 - Full-text search across all transcripts (SQLite FTS5, ⌘K), in-transcript find.
 - Export TXT, Markdown, SRT, VTT, JSON.
 

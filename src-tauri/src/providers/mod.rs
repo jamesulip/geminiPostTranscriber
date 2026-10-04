@@ -17,6 +17,14 @@ pub struct Segment {
     pub speaker: Option<String>,
 }
 
+/// A recognized word with its time (relative to the audio that was sent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Word {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
 /// Token counts if the provider reports them (0 otherwise).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
@@ -47,6 +55,9 @@ pub struct Transcription {
     /// Set when Google blocked this part on the job's model and another model transcribed it.
     #[serde(default)]
     pub fallback: Option<Fallback>,
+    /// Word timings, when asked for (`Request::word_timestamps`) and the provider gives them.
+    #[serde(default)]
+    pub words: Vec<Word>,
 }
 
 /// A part re-done with other models after Google blocked it.
@@ -148,6 +159,8 @@ pub struct Request<'a> {
     pub on_retry: &'a (dyn Fn(String) + Send + Sync),
     /// Set by the Cancel button; checked during requests and retry waits.
     pub cancel: &'a std::sync::atomic::AtomicBool,
+    /// Also return word timings (Whisper-style APIs only).
+    pub word_timestamps: bool,
 }
 
 
@@ -356,7 +369,7 @@ mod tests {
         });
         let req = Request {
             path: &audio, duration: 10.0, language: None, known_speakers: &[], previous_text: "", glossary: &[],
-            on_retry: &|_| {}, cancel: &cancel,
+            on_retry: &|_| {}, cancel: &cancel, word_timestamps: false,
         };
         let start = std::time::Instant::now();
         let err = transcribe(&reqwest::Client::new(), &cfg, &req).await.unwrap_err();

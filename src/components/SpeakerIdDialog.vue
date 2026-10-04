@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
-import { Loader2, Pause, Play, SkipForward } from "@lucide/vue";
+import { Loader2, Merge, Pause, Play, SkipForward } from "@lucide/vue";
 import { toast } from "vue-sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { api, type SegmentRow } from "@/lib/api";
 import { formatTime, speakerColor } from "@/lib/format";
@@ -12,6 +13,7 @@ import { formatTime, speakerColor } from "@/lib/format";
  * Put names to the speaker labels a diarizing model produced ("Speaker 1", …): one row per
  * speaker with a few representative clips to listen to and a name field. Enter saves the row and
  * jumps to the next speaker, playing one of their clips, so a meeting can be labeled in a minute.
+ * Giving two speakers the same name offers to merge them (the diarizer split one voice in two).
  */
 const props = defineProps<{
   transcriptId: string;
@@ -20,8 +22,12 @@ const props = defineProps<{
   names: Record<string, string>;
   /** Audio URL of the main player (so the same playback copy is used). */
   src: string;
+  /** False while a job that rewrites the labels is running. */
+  canMerge: boolean;
+  /** Whether "Fix timestamps" can start now (offered when clips don't match their text). */
+  canRetime: boolean;
 }>();
-const emit = defineEmits<{ close: []; saved: [] }>();
+const emit = defineEmits<{ close: []; saved: [merged?: { versionId: number; summary: string }]; fixTimestamps: [] }>();
 
 const SAMPLES = 5;
 /** Clips longer than this are cut off: a few seconds is enough to recognize a voice. */
@@ -63,6 +69,21 @@ const drafts = reactive<Record<string, string>>(
 );
 const sampleIdx = reactive<Record<string, number>>(Object.fromEntries(props.speakerOrder.map((l) => [l, 0])));
 const changed = computed(() => props.speakerOrder.filter((l) => drafts[l].trim() && drafts[l].trim() !== (props.names[l] ?? l)));
+
+/** Name each speaker will have after saving. */
+const finalName = (l: string) => drafts[l].trim() || (props.names[l] ?? l);
+/** Speakers sharing a name, in speaker order (the first one's label is kept when merging). */
+const sameName = computed(() => {
+  if (!props.canMerge) return [];
+  const groups = new Map<string, string[]>();
+  for (const l of props.speakerOrder) {
+    const key = finalName(l).toLowerCase();
+    groups.set(key, [...(groups.get(key) ?? []), l]);
+  }
+  return [...groups.values()].filter((g) => g.length > 1);
+});
+const mergeSame = ref(true);
+const merging = computed(() => (mergeSame.value ? sameName.value : []));
 
 // --- playback ------------------------------------------------------------------
 
@@ -139,6 +160,17 @@ async function save() {
   saving.value = true;
   try {
     for (const l of changed.value) await api.renameSpeaker(props.transcriptId, l, drafts[l].trim());
+    // The first merge archives the labels from before any of them (names already saved), for undo.
+    let versionId: number | null = null;
+    for (const [into, ...from] of merging.value) {
+      const v = await api.mergeSpeakers(props.transcriptId, from, into, finalName(into));
+      versionId ??= v;
+    }
+    if (versionId !== null) {
+      const groups = merging.value.map((g) => `“${finalName(g[0])}”`);
+      emit("saved", { versionId, summary: `Merged speakers named ${groups.join(", ")}` });
+      return;
+    }
     if (changed.value.length) toast.success(`Named ${changed.value.length} speaker(s)`);
     emit("saved");
   } catch (e) {
@@ -228,11 +260,28 @@ async function save() {
           />
         </div>
       </div>
+      <label v-if="sameName.length" class="flex cursor-pointer items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-900 dark:bg-amber-950/40">
+        <Checkbox v-model="mergeSame" class="mt-0.5" />
+        <span>
+          <b>Merge speakers with the same name</b><br />
+          <span class="text-muted-foreground text-xs">
+            <template v-for="(g, gi) in sameName" :key="g[0]">{{ gi ? "; " : "" }}{{ g.join(" + ") }} → “{{ finalName(g[0]) }}”</template>.
+            Their turns get one label; the labels from before stay in the transcription history.
+          </span>
+        </span>
+      </label>
       <DialogFooter class="items-center">
         <span v-if="changed.length" class="text-muted-foreground mr-auto text-xs">{{ changed.length }} name(s) to save</span>
+        <button
+          v-else-if="canRetime"
+          class="text-muted-foreground hover:text-foreground mr-auto text-xs underline-offset-2 hover:underline"
+          title="Moves each line to where its words are actually spoken"
+          @click="emit('fixTimestamps')"
+        >Clips don't match the text? Fix timestamps…</button>
         <Button variant="ghost" @click="emit('close')">Cancel</Button>
-        <Button :disabled="!changed.length || saving" @click="save">
-          <Loader2 v-if="saving" class="animate-spin" /> Save names
+        <Button :disabled="(!changed.length && !merging.length) || saving" @click="save">
+          <Loader2 v-if="saving" class="animate-spin" /><Merge v-else-if="merging.length" />
+          {{ merging.length ? "Save and merge" : "Save names" }}
         </Button>
       </DialogFooter>
     </DialogContent>

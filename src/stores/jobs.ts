@@ -30,6 +30,7 @@ export const useJobs = defineStore("jobs", () => {
         else if (wasCancelled) toast(`${title} cancelled`, { description: "Finished chunks are kept; Retry continues from there." });
         else if (p.error) toast.error(`${title} failed`, { description: p.error });
         else if (p.stage === "diarize") toast.success(`${title}: ${p.message || "speakers found"}`, { description: "The previous speaker labels were kept in the history." });
+        else if (p.stage === "align") toast.success(`${title}: timestamps fixed`, { description: `${p.message.charAt(0).toUpperCase()}${p.message.slice(1)}. The previous timing was kept in the history.` });
         else toast.success(`${title} transcribed`);
       } else {
         progress[p.id] = p;

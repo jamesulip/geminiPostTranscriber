@@ -955,6 +955,69 @@ pub fn rename_speaker(c: &Connection, id: &str, label: &str, name: &str) -> Resu
     Ok(())
 }
 
+/// Relabel every turn of the `from` speakers as `into` (they turned out to be the same person),
+/// optionally renaming `into`. The previous labeling is archived as a version, since a merge can't
+/// be told apart afterwards; returns that version's id.
+pub fn merge_speakers(c: &mut Connection, id: &str, from: &[String], into: &str, name: Option<&str>) -> Result<i64> {
+    if from.is_empty() || from.iter().any(|l| l == into) {
+        anyhow::bail!("Pick at least one other speaker to merge into {into}");
+    }
+    let tx = c.transaction()?;
+    let used: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM segments WHERE transcript_id = ?1 AND speaker = ?2)", params![id, into], |r| r.get(0))?;
+    if !used {
+        anyhow::bail!("{into} has no turns in this transcript");
+    }
+    archive_current(&tx, id)?;
+    let archived = tx.last_insert_rowid();
+    for label in from {
+        tx.execute("UPDATE segments SET speaker = ?3 WHERE transcript_id = ?1 AND speaker = ?2", params![id, label, into])?;
+        tx.execute("DELETE FROM speakers WHERE transcript_id = ?1 AND label = ?2", params![id, label])?;
+    }
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        rename_speaker(&tx, id, into, name)?;
+    }
+    next_version(&tx, id)?;
+    refresh_content_hash(&tx, id)?;
+    tx.commit()?;
+    Ok(archived)
+}
+
+/// Move the current version's lines to new times (text, speakers and order unchanged), archiving
+/// the previous timing as a version. Fails if the lines changed since `expected_hash` was taken.
+pub fn apply_timings(c: &mut Connection, id: &str, timings: &[(i64, f64, f64)], expected_hash: &str) -> Result<()> {
+    let tx = c.transaction()?;
+    if content_hash(&segments_for(&tx, id)?) != expected_hash {
+        anyhow::bail!("The transcript was changed while its timestamps were being fixed; run it again");
+    }
+    archive_current(&tx, id)?;
+    {
+        let mut st = tx.prepare("UPDATE segments SET start = ?2, end = ?3 WHERE id = ?1 AND transcript_id = ?4")?;
+        for (sid, start, end) in timings {
+            st.execute(params![sid, start, end, id])?;
+        }
+    }
+    next_version(&tx, id)?;
+    let hash = refresh_content_hash(&tx, id)?;
+    // Same lines, same words: an English translation made for the old timing still fits.
+    tx.execute(
+        "UPDATE ai_digests SET content_hash = ?3 WHERE transcript_id = ?1 AND kind = 'translation_en' AND content_hash = ?2",
+        params![id, expected_hash, hash],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Give the current version the next free number (after archiving the previous one).
+fn next_version(tx: &rusqlite::Transaction, id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE transcripts SET version = (SELECT MAX(version, COALESCE((SELECT MAX(number) FROM transcript_versions WHERE transcript_id = ?1), 0)) + 1
+           FROM transcripts WHERE id = ?1) WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
 pub fn update_segment(c: &Connection, segment_id: i64, text: &str, speaker: Option<&str>) -> Result<()> {
     c.execute("UPDATE segments SET text = ?2, speaker = ?3 WHERE id = ?1", params![segment_id, text, speaker])?;
     let id: Option<String> =
@@ -1374,6 +1437,71 @@ mod tests {
         let sum = usage_summary(&c).unwrap();
         assert_eq!(sum.recent[0].transcript_id, None);
         assert_eq!(sum.all_time.jobs, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_speakers_relabels_and_archives() {
+        let dir = std::env::temp_dir().join(format!("transcriber-test-{}", uuid::Uuid::new_v4()));
+        let mut c = open(&dir.join("db.sqlite")).unwrap();
+        insert_transcript(
+            &c,
+            &NewTranscript {
+                id: "t1", title: "Sync", folder_id: None, audio_path: "/x.ogg", source_name: "x.ogg",
+                provider: "gemini", model: "m", language: None, recorded_at: None, tag_ids: &[],
+            },
+        )
+        .unwrap();
+        let seg = |start: f64, who: &str| Segment { start, end: start + 1.0, text: format!("line {start}"), speaker: Some(who.into()) };
+        let segs = vec![seg(0.0, "Speaker 1"), seg(1.0, "Speaker 2"), seg(2.0, "Speaker 3"), seg(3.0, "Speaker 1")];
+        let v = CompletedVersion { provider: "gemini", model: "m", language: None, detected_language: None, processed_duration: 4.0, notes: None };
+        commit_version(&mut c, "t1", &segs, &v).unwrap();
+        rename_speaker(&c, "t1", "Speaker 3", "Alice").unwrap();
+        let before = get_transcript(&c, "t1").unwrap().unwrap();
+
+        // The target must be a speaker of this transcript, and not one of the merged ones.
+        assert!(merge_speakers(&mut c, "t1", &[], "Speaker 1", None).is_err());
+        assert!(merge_speakers(&mut c, "t1", &["Speaker 1".into()], "Speaker 1", None).is_err());
+        assert!(merge_speakers(&mut c, "t1", &["Speaker 2".into()], "Speaker 9", None).is_err());
+        assert!(list_versions(&c, "t1").unwrap().is_empty());
+
+        let archived = merge_speakers(&mut c, "t1", &["Speaker 2".into(), "Speaker 3".into()], "Speaker 1", Some("Alice")).unwrap();
+        let d = get_transcript(&c, "t1").unwrap().unwrap();
+        assert!(d.segments.iter().all(|s| s.speaker.as_deref() == Some("Speaker 1")));
+        assert_eq!(d.speakers, vec![Speaker { label: "Speaker 1".into(), display_name: "Alice".into() }]);
+        assert_eq!(d.summary.version, before.summary.version + 1);
+        assert_eq!(d.summary.transcribed_at, before.summary.transcribed_at);
+        assert_ne!(d.summary.content_hash, before.summary.content_hash);
+
+        // One archived version, holding the labels from before the merge.
+        let vs = list_versions(&c, "t1").unwrap();
+        assert_eq!((vs.len(), vs[0].id, vs[0].number), (1, archived, before.summary.version));
+        let old = get_version(&c, archived).unwrap().unwrap();
+        assert_eq!(old.segments.iter().map(|s| s.speaker.clone().unwrap()).collect::<Vec<_>>(), ["Speaker 1", "Speaker 2", "Speaker 3", "Speaker 1"]);
+        assert_eq!(old.speakers.len(), 3);
+
+        // Restoring that version undoes the merge.
+        restore_version(&mut c, archived).unwrap();
+        assert_eq!(get_transcript(&c, "t1").unwrap().unwrap().speakers, before.speakers);
+
+        // New times for the lines; refused once the lines changed underneath.
+        let d = get_transcript(&c, "t1").unwrap().unwrap();
+        let hash = content_hash(&d.segments);
+        let timings: Vec<(i64, f64, f64)> = d.segments.iter().map(|s| (s.id, s.start + 0.5, s.end + 0.5)).collect();
+        update_segment(&c, d.segments[0].id, "edited", Some("Speaker 1")).unwrap();
+        assert!(apply_timings(&mut c, "t1", &timings, &hash).is_err());
+        let d = get_transcript(&c, "t1").unwrap().unwrap();
+        crate::ai::store::put_digest(&c, "t1", "translation_en", &content_hash(&d.segments), "m", "{}").unwrap();
+        crate::ai::store::put_digest(&c, "t1", "summary", &content_hash(&d.segments), "m", "{}").unwrap();
+        apply_timings(&mut c, "t1", &timings, &content_hash(&d.segments)).unwrap();
+        let after = get_transcript(&c, "t1").unwrap().unwrap();
+        // The translation carries over; the summary (which cites times) goes stale.
+        let digest_hash = |kind| crate::ai::store::digest(&c, "t1", kind).unwrap().unwrap().content_hash;
+        assert_eq!(digest_hash("translation_en"), content_hash(&after.segments));
+        assert_ne!(digest_hash("summary"), content_hash(&after.segments));
+        assert_eq!(after.segments.iter().map(|s| s.start).collect::<Vec<_>>(), [0.5, 1.5, 2.5, 3.5]);
+        // v2 (the merge) is still archived, so the re-timed version gets the next free number.
+        assert_eq!((after.segments[0].text.as_str(), d.summary.version, after.summary.version), ("edited", 1, 3));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

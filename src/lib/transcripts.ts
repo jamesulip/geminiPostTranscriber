@@ -19,5 +19,6 @@ export function fixReason(t: TranscriptSummary): string {
   if (t.status === "error") return t.error ?? "Transcription failed";
   const notes = problemNotes(t);
   if (notes.length) return notes.length === 1 ? notes[0] : `${notes.length} parts may be incomplete`;
+  if (t.error?.startsWith("Fixing timestamps failed")) return t.error;
   return t.error ? `Last re-transcription failed: ${t.error}` : "";
 }
