@@ -7,8 +7,9 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { toast } from "vue-sonner";
 import {
   AlertCircle, AlertTriangle, ArrowLeft, Check, Download, GitCompare, History, Loader2, LocateFixed, MoreHorizontal, Pause,
-  Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, UserSearch, Users, Wrench,
+  Flag, Play, Moon, RefreshCw, RotateCcw, Search, Shrink, Trash2, UserSearch, Users, Wrench,
 } from "@lucide/vue";
+import ConfirmDialog from "@/components/ConfirmDialog.vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
@@ -406,8 +407,30 @@ async function startRetry() {
 
 async function remove() {
   if (!t.value) return;
-  await api.deleteTranscript(t.value.id);
-  await library.refresh();
+  await library.trash(t.value.id);
+  toast.success("Moved to trash");
+  router.push({ name: "library" });
+}
+
+async function toggleFlag() {
+  if (!t.value) return;
+  const flagged = !t.value.flagged;
+  t.value.flagged = flagged;
+  await library.setFlagged(t.value.id, flagged);
+}
+
+async function restore() {
+  if (!t.value) return;
+  await library.restore(t.value.id);
+  t.value.trashed_at = null;
+  toast.success("Restored");
+}
+
+const confirmDelete = ref(false);
+async function deleteForever() {
+  if (!t.value) return;
+  confirmDelete.value = false;
+  await library.deleteForever(t.value.id);
   router.push({ name: "library" });
 }
 
@@ -489,7 +512,13 @@ const saved = computed(() =>
           <DropdownMenuItem :disabled="t.status === 'processing' || t.status === 'queued'" @click="openRetry"><RefreshCw /> Re-transcribe all…</DropdownMenuItem>
           <DropdownMenuItem v-if="t.status === 'processing' || t.status === 'queued'" @click="jobs.cancel(t.id)">Cancel job</DropdownMenuItem>
           <DropdownMenuSeparator />
-          <DropdownMenuItem variant="destructive" @click="remove"><Trash2 /> Delete</DropdownMenuItem>
+          <DropdownMenuItem @click="toggleFlag"><Flag /> {{ t.flagged ? "Remove flag" : "Flag" }}</DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <template v-if="t.trashed_at">
+            <DropdownMenuItem @click="restore"><RotateCcw /> Restore from trash</DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" @click="confirmDelete = true"><Trash2 /> Delete forever…</DropdownMenuItem>
+          </template>
+          <DropdownMenuItem v-else variant="destructive" @click="remove"><Trash2 /> Move to trash</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </header>
@@ -515,6 +544,17 @@ const saved = computed(() =>
         <Button size="sm" @click="restoreViewed"><RotateCcw /> Restore this version</Button>
         <Button size="sm" variant="ghost" @click="deleteViewed"><Trash2 /> Delete</Button>
         <Button size="sm" variant="outline" @click="viewVersion(null)">Back to current</Button>
+      </div>
+    </div>
+    <div
+      v-else-if="t.trashed_at"
+      class="flex items-center gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm dark:border-amber-900 dark:bg-amber-950/40"
+    >
+      <Trash2 class="size-4 shrink-0 text-amber-600" />
+      <span class="min-w-0 truncate">This transcript is in the trash (since {{ formatDate(t.trashed_at) }}).</span>
+      <div class="ml-auto flex shrink-0 gap-1.5">
+        <Button size="sm" @click="restore"><RotateCcw /> Restore</Button>
+        <Button size="sm" variant="ghost" @click="confirmDelete = true"><Trash2 /> Delete forever</Button>
       </div>
     </div>
     <div
@@ -756,6 +796,15 @@ const saved = computed(() =>
       </template>
     </div>
 
+    <ConfirmDialog
+      v-if="confirmDelete"
+      title="Delete forever?"
+      description="The transcript and its audio copy will be removed. This can't be undone."
+      confirm-label="Delete forever"
+      destructive
+      @close="confirmDelete = false"
+      @confirm="deleteForever"
+    />
     <FixProblemsDialog
       v-if="fixing && settingsStore.settings"
       :t="t"

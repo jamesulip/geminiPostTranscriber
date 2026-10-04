@@ -86,6 +86,10 @@ export interface TranscriptSummary {
   transcribed_at: string | null;
   /** Parts of the current version that may be incomplete (one per line). */
   notes: string | null;
+  /** Marked by the user for attention. */
+  flagged: boolean;
+  /** Set while the transcript is in the trash. */
+  trashed_at: string | null;
 }
 
 /** An archived (non-current) transcription. */
@@ -213,6 +217,8 @@ export interface ListFilter {
   folder_id: number | null;
   tag_id: number | null;
   recursive: boolean;
+  /** List the trash instead of the library. */
+  trashed: boolean;
 }
 
 /** A stretch of a transcript that looks wrong. */
@@ -277,6 +283,10 @@ export const api = {
   updateTranscript: (id: string, title: string, folderId: number | null, tagIds: number[]) =>
     invoke<void>("update_transcript", { id, title, folderId, tagIds }),
   deleteTranscript: (id: string) => invoke<void>("delete_transcript", { id }),
+  trashTranscript: (id: string) => invoke<void>("trash_transcript", { id }),
+  restoreTranscript: (id: string) => invoke<void>("restore_transcript", { id }),
+  emptyTrash: () => invoke<void>("empty_trash"),
+  setFlagged: (id: string, flagged: boolean) => invoke<void>("set_flagged", { id, flagged }),
   renameSpeaker: (id: string, label: string, name: string) => invoke<void>("rename_speaker", { id, label, name }),
   updateSegment: (segmentId: number, text: string, speaker: string | null) =>
     invoke<void>("update_segment", { segmentId, text, speaker }),
@@ -298,5 +308,6 @@ export const api = {
   deleteFolder: (id: number) => invoke<void>("delete_folder", { id }),
   listTags: () => invoke<Tag[]>("list_tags"),
   createTag: (name: string, color: string) => invoke<Tag>("create_tag", { name, color }),
+  updateTag: (id: number, name: string, color: string) => invoke<void>("update_tag", { id, name, color }),
   deleteTag: (id: number) => invoke<void>("delete_tag", { id }),
 };

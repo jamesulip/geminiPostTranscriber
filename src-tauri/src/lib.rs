@@ -383,27 +383,62 @@ fn update_transcript(
     db::update_transcript(&state.db.lock().unwrap(), &id, &title, folder_id, &tag_ids).map_err(err)
 }
 
-#[tauri::command]
-fn delete_transcript(app: AppHandle, state: State<AppState>, id: String) -> CmdResult<()> {
-    // Stop a pending overnight batch so Google doesn't keep working (and billing) on it.
-    let queued = db::get_transcript(&state.db.lock().unwrap(), &id).ok().flatten().is_some_and(|t| t.summary.status == "queued");
+/// Stop a running job or pending overnight batch so Google doesn't keep working (and billing) on it.
+fn stop_work(app: &AppHandle, state: &AppState, id: &str) {
+    let queued = db::get_transcript(&state.db.lock().unwrap(), id).ok().flatten().is_some_and(|t| t.summary.status == "queued");
     if queued {
-        let (app, id) = (app.clone(), id.clone());
+        let (app, id) = (app.clone(), id.to_string());
         tauri::async_runtime::spawn(async move {
             let _ = batch::cancel(&app, &id).await;
         });
     }
-    if let Some(c) = state.cancels.lock().unwrap().get(&id) {
+    if let Some(c) = state.cancels.lock().unwrap().get(id) {
         c.store(true, Ordering::Relaxed);
     }
-    let audio = db::delete_transcript(&state.db.lock().unwrap(), &id).map_err(err)?;
-    let _ = std::fs::remove_dir_all(state.cache_dir.join("results").join(&id));
+}
+
+/// Permanently delete a transcript: database row plus its audio copy and caches.
+fn purge_transcript(app: &AppHandle, state: &AppState, id: &str) -> CmdResult<()> {
+    stop_work(app, state, id);
+    let audio = db::delete_transcript(&state.db.lock().unwrap(), id).map_err(err)?;
+    let _ = std::fs::remove_dir_all(state.cache_dir.join("results").join(id));
+    let _ = std::fs::remove_dir_all(state.data_dir.join("raw").join(id));
     if let Some(p) = audio {
         let _ = std::fs::remove_file(audio::playback_path(std::path::Path::new(&p)));
         let _ = std::fs::remove_file(std::path::Path::new(&p).with_extension("levels.bin"));
         let _ = std::fs::remove_file(p);
     }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_transcript(app: AppHandle, state: State<AppState>, id: String) -> CmdResult<()> {
+    purge_transcript(&app, &state, &id)
+}
+
+#[tauri::command]
+fn trash_transcript(app: AppHandle, state: State<AppState>, id: String) -> CmdResult<()> {
+    stop_work(&app, &state, &id);
+    db::trash_transcript(&state.db.lock().unwrap(), &id).map_err(err)
+}
+
+#[tauri::command]
+fn restore_transcript(state: State<AppState>, id: String) -> CmdResult<()> {
+    db::restore_transcript(&state.db.lock().unwrap(), &id).map_err(err)
+}
+
+#[tauri::command]
+fn empty_trash(app: AppHandle, state: State<AppState>) -> CmdResult<()> {
+    let ids = db::trashed_ids(&state.db.lock().unwrap()).map_err(err)?;
+    for id in ids {
+        purge_transcript(&app, &state, &id)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_flagged(state: State<AppState>, id: String, flagged: bool) -> CmdResult<()> {
+    db::set_flagged(&state.db.lock().unwrap(), &id, flagged).map_err(err)
 }
 
 #[tauri::command]
@@ -515,6 +550,11 @@ fn create_tag(state: State<AppState>, name: String, color: String) -> CmdResult<
 }
 
 #[tauri::command]
+fn update_tag(state: State<AppState>, id: i64, name: String, color: String) -> CmdResult<()> {
+    db::update_tag(&state.db.lock().unwrap(), id, &name, &color).map_err(err)
+}
+
+#[tauri::command]
 fn delete_tag(state: State<AppState>, id: i64) -> CmdResult<()> {
     db::delete_tag(&state.db.lock().unwrap(), id).map_err(err)
 }
@@ -567,6 +607,10 @@ pub fn run() {
             get_transcript,
             update_transcript,
             delete_transcript,
+            trash_transcript,
+            restore_transcript,
+            empty_trash,
+            set_flagged,
             rename_speaker,
             update_segment,
             search,
@@ -583,6 +627,7 @@ pub fn run() {
             delete_folder,
             list_tags,
             create_tag,
+            update_tag,
             delete_tag,
         ])
         .run(tauri::generate_context!())

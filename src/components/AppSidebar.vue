@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import {
-  AudioLines, ChartColumn, ChevronRight, Moon, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon,
+  AudioLines, ChartColumn, ChevronRight, Moon, Folder, FolderPlus, Inbox, MoreHorizontal, Plus, Search, Settings, Tag as TagIcon, Trash2,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -10,12 +10,13 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import PromptDialog from "./PromptDialog.vue";
+import TagDialog from "./TagDialog.vue";
 import { useLibrary, type Selection } from "@/stores/library";
 import { useUi } from "@/stores/ui";
 import { useJobs } from "@/stores/jobs";
 import { TAG_COLORS } from "@/lib/format";
 import { pickAudioFiles } from "@/lib/files";
-import type { Folder as FolderT } from "@/lib/api";
+import type { Folder as FolderT, Tag } from "@/lib/api";
 
 const library = useLibrary();
 const ui = useUi();
@@ -28,11 +29,13 @@ const waitingBatches = computed(() => library.transcripts.filter((t) => t.status
 
 type Prompt = { title: string; initial?: string; submit: (v: string) => Promise<unknown> };
 const prompt = ref<Prompt | null>(null);
+/** Tag being renamed/recolored, or `{}` for a new one. */
+const tagDialog = ref<Partial<Tag> | null>(null);
 
 function isSelected(s: Selection) {
   const cur = library.selection;
   if (route.name !== "library") return false;
-  return cur.kind === s.kind && (s.kind === "all" || (cur as { id: number }).id === (s as { id: number }).id);
+  return cur.kind === s.kind && (s.kind === "all" || s.kind === "trash" || (cur as { id: number }).id === (s as { id: number }).id);
 }
 
 async function go(s: Selection) {
@@ -68,10 +71,14 @@ function newFolder(parentId: number | null = null) {
 }
 
 function newTag() {
-  prompt.value = {
-    title: "New tag",
-    submit: (n) => library.createTag(n, TAG_COLORS[library.tags.length % TAG_COLORS.length]),
-  };
+  tagDialog.value = { color: TAG_COLORS[library.tags.length % TAG_COLORS.length] };
+}
+
+async function saveTag(name: string, color: string) {
+  const id = tagDialog.value?.id;
+  if (id) await library.updateTag(id, name, color);
+  else await library.createTag(name, color);
+  tagDialog.value = null;
 }
 
 async function upload() {
@@ -159,11 +166,21 @@ async function upload() {
               <button class="text-muted-foreground mr-1 opacity-0 group-hover:opacity-100"><MoreHorizontal class="size-4" /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start">
+              <DropdownMenuItem @click="tagDialog = { ...tag }">Edit tag…</DropdownMenuItem>
+              <DropdownMenuSeparator />
               <DropdownMenuItem variant="destructive" @click="library.deleteTag(tag.id)">Delete tag</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
         <p v-if="!library.tags.length" class="text-muted-foreground px-2 py-1 text-xs">No tags yet</p>
+
+        <button
+          class="hover:bg-sidebar-accent mt-4 flex items-center gap-2 rounded-md px-2 py-1.5 text-left"
+          :class="isSelected({ kind: 'trash' }) && 'bg-sidebar-accent font-medium'"
+          @click="go({ kind: 'trash' })"
+        >
+          <Trash2 class="size-4" /> Trash
+        </button>
       </nav>
     </ScrollArea>
 
@@ -197,6 +214,14 @@ async function upload() {
       </Button>
     </div>
 
+    <TagDialog
+      v-if="tagDialog"
+      :title="tagDialog.id ? 'Edit tag' : 'New tag'"
+      :initial-name="tagDialog.name"
+      :initial-color="tagDialog.color"
+      @close="tagDialog = null"
+      @submit="saveTag"
+    />
     <PromptDialog
       v-if="prompt"
       :title="prompt.title"

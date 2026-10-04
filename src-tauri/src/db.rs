@@ -28,6 +28,8 @@ fn migrate(c: &Connection) -> Result<()> {
         ("notes", "TEXT"),
         ("partial", "TEXT"),
         ("batch", "TEXT"),
+        ("flagged", "INTEGER NOT NULL DEFAULT 0"),
+        ("trashed_at", "TEXT"),
     ] {
         if !cols.iter().any(|c| c == name) {
             c.execute_batch(&format!("ALTER TABLE transcripts ADD COLUMN {name} {ty}"))?;
@@ -209,6 +211,10 @@ pub struct TranscriptSummary {
     pub transcribed_at: Option<String>,
     /// Parts of the current version that may be incomplete.
     pub notes: Option<String>,
+    /// Marked by the user for attention.
+    pub flagged: bool,
+    /// Set while the transcript is in the trash.
+    pub trashed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -370,7 +376,7 @@ pub fn list_batches(c: &Connection) -> Result<Vec<BatchRecord>> {
 
 /// Transcript id for a title (used to link batches sent before they were recorded locally).
 pub fn transcript_id_by_title(c: &Connection, title: &str) -> Result<Option<String>> {
-    Ok(c.query_row("SELECT id FROM transcripts WHERE title = ?1 ORDER BY created_at DESC LIMIT 1", [title], |r| r.get(0))
+    Ok(c.query_row("SELECT id FROM transcripts WHERE title = ?1 AND trashed_at IS NULL ORDER BY created_at DESC LIMIT 1", [title], |r| r.get(0))
         .optional()?)
 }
 
@@ -629,7 +635,8 @@ fn tags_for(c: &Connection, id: &str) -> Result<Vec<Tag>> {
 const SUMMARY_COLS: &str = "t.id, t.title, t.folder_id, t.source_name, t.duration, t.processed_duration, t.provider,
     t.model, t.status, t.error, t.created_at,
     (SELECT substr(group_concat(text, ' '), 1, 200) FROM (SELECT text FROM segments s WHERE s.transcript_id = t.id ORDER BY idx LIMIT 3)),
-    t.recorded_at, COALESCE(NULLIF(t.language, ''), t.detected_language), t.version, t.transcribed_at, t.notes";
+    t.recorded_at, COALESCE(NULLIF(t.language, ''), t.detected_language), t.version, t.transcribed_at, t.notes,
+    t.flagged, t.trashed_at";
 
 fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
     Ok(TranscriptSummary {
@@ -651,6 +658,8 @@ fn summary_from_row(r: &rusqlite::Row) -> rusqlite::Result<TranscriptSummary> {
         version: r.get(14)?,
         transcribed_at: r.get(15)?,
         notes: r.get(16)?,
+        flagged: r.get::<_, i64>(17)? != 0,
+        trashed_at: r.get(18)?,
     })
 }
 
@@ -661,6 +670,9 @@ pub struct ListFilter {
     /// Include transcripts in sub-folders of `folder_id`.
     #[serde(default)]
     pub recursive: bool,
+    /// List the trash instead of the library.
+    #[serde(default)]
+    pub trashed: bool,
 }
 
 pub fn list_transcripts(c: &Connection, f: &ListFilter) -> Result<Vec<TranscriptSummary>> {
@@ -672,10 +684,11 @@ pub fn list_transcripts(c: &Connection, f: &ListFilter) -> Result<Vec<Transcript
          SELECT {SUMMARY_COLS} FROM transcripts t
          WHERE (?1 IS NULL OR t.folder_id IN (SELECT id FROM sub))
            AND (?2 IS NULL OR EXISTS (SELECT 1 FROM transcript_tags tt WHERE tt.transcript_id = t.id AND tt.tag_id = ?2))
-         ORDER BY t.created_at DESC"
+           AND (t.trashed_at IS NOT NULL) = ?4
+         ORDER BY t.trashed_at DESC, t.created_at DESC"
     );
     let mut st = c.prepare(&sql)?;
-    let rows = st.query_map(params![f.folder_id, f.tag_id, f.recursive], summary_from_row)?;
+    let rows = st.query_map(params![f.folder_id, f.tag_id, f.recursive, f.trashed], summary_from_row)?;
     let mut out: Vec<TranscriptSummary> = rows.collect::<Result<_, _>>()?;
     for t in &mut out {
         t.tags = tags_for(c, &t.id)?;
@@ -704,10 +717,10 @@ pub fn get_transcript(c: &Connection, id: &str) -> Result<Option<TranscriptDetai
         .query_row(&sql, [id], |r| {
             Ok((
                 summary_from_row(r)?,
-                r.get::<_, String>(17)?,
-                r.get::<_, Option<String>>(18)?,
-                r.get::<_, Option<String>>(19)?,
+                r.get::<_, String>(19)?,
                 r.get::<_, Option<String>>(20)?,
+                r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<String>>(22)?,
             ))
         })
         .optional()?;
@@ -737,6 +750,28 @@ fn set_tags(c: &Connection, id: &str, tag_ids: &[i64]) -> Result<()> {
         c.execute("INSERT OR IGNORE INTO transcript_tags (transcript_id, tag_id) VALUES (?1, ?2)", params![id, t])?;
     }
     Ok(())
+}
+
+pub fn set_flagged(c: &Connection, id: &str, flagged: bool) -> Result<()> {
+    c.execute("UPDATE transcripts SET flagged = ?2 WHERE id = ?1", params![id, flagged as i64])?;
+    Ok(())
+}
+
+/// Move to the trash: hidden from the library and search, files kept.
+pub fn trash_transcript(c: &Connection, id: &str) -> Result<()> {
+    c.execute("UPDATE transcripts SET trashed_at = ?2 WHERE id = ?1", params![id, chrono::Local::now().to_rfc3339()])?;
+    Ok(())
+}
+
+pub fn restore_transcript(c: &Connection, id: &str) -> Result<()> {
+    c.execute("UPDATE transcripts SET trashed_at = NULL WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+pub fn trashed_ids(c: &Connection) -> Result<Vec<String>> {
+    let mut st = c.prepare("SELECT id FROM transcripts WHERE trashed_at IS NOT NULL")?;
+    let rows = st.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 pub fn delete_transcript(c: &Connection, id: &str) -> Result<Option<String>> {
@@ -819,7 +854,7 @@ pub fn search(c: &Connection, q: &str, limit: i64) -> Result<Vec<SearchHit>> {
          JOIN segments s ON s.id = segments_fts.rowid
          JOIN transcripts t ON t.id = s.transcript_id
          LEFT JOIN speakers sp ON sp.transcript_id = s.transcript_id AND sp.label = s.speaker
-         WHERE segments_fts MATCH ?1
+         WHERE segments_fts MATCH ?1 AND t.trashed_at IS NULL
          ORDER BY rank LIMIT ?2",
     )?;
     let mut hits: Vec<SearchHit> = st
@@ -837,7 +872,7 @@ pub fn search(c: &Connection, q: &str, limit: i64) -> Result<Vec<SearchHit>> {
 
     // Title matches (shown first, pointing at the beginning).
     let like = format!("%{}%", q.trim());
-    let mut st = c.prepare("SELECT id, title FROM transcripts WHERE title LIKE ?1 LIMIT 10")?;
+    let mut st = c.prepare("SELECT id, title FROM transcripts WHERE title LIKE ?1 AND trashed_at IS NULL LIMIT 10")?;
     let titles: Vec<SearchHit> = st
         .query_map([like], |r| {
             let title: String = r.get(1)?;
@@ -1054,6 +1089,11 @@ pub fn create_tag(c: &Connection, name: &str, color: &str) -> Result<Tag> {
     Ok(Tag { id: c.last_insert_rowid(), name: name.into(), color: color.into() })
 }
 
+pub fn update_tag(c: &Connection, id: i64, name: &str, color: &str) -> Result<()> {
+    c.execute("UPDATE tags SET name = ?2, color = ?3 WHERE id = ?1", params![id, name, color])?;
+    Ok(())
+}
+
 pub fn delete_tag(c: &Connection, id: i64) -> Result<()> {
     c.execute("DELETE FROM tags WHERE id = ?1", [id])?;
     Ok(())
@@ -1101,11 +1141,11 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("<mark>"));
 
-        let f = ListFilter { folder_id: Some(parent.id), tag_id: None, recursive: true };
+        let f = ListFilter { folder_id: Some(parent.id), tag_id: None, recursive: true, trashed: false };
         assert_eq!(list_transcripts(&c, &f).unwrap().len(), 1);
-        let f = ListFilter { folder_id: Some(parent.id), tag_id: None, recursive: false };
+        let f = ListFilter { folder_id: Some(parent.id), tag_id: None, recursive: false, trashed: false };
         assert_eq!(list_transcripts(&c, &f).unwrap().len(), 0);
-        let f = ListFilter { folder_id: None, tag_id: Some(tag.id), recursive: false };
+        let f = ListFilter { folder_id: None, tag_id: Some(tag.id), recursive: false, trashed: false };
         assert_eq!(list_transcripts(&c, &f).unwrap()[0].tags.len(), 1);
 
         let u = NewUsage {
@@ -1123,6 +1163,22 @@ mod tests {
         assert!((t.cost_usd - 0.024).abs() < 1e-9 && (t.saved_usd - 0.036).abs() < 1e-9);
         let sum = usage_summary(&c).unwrap();
         assert_eq!((sum.all_time.jobs, sum.this_month.jobs, sum.by_month.len(), sum.recent.len()), (1, 1, 1, 1));
+
+        // Flag and trash.
+        set_flagged(&c, "t1", true).unwrap();
+        assert!(list_transcripts(&c, &ListFilter::default()).unwrap()[0].flagged);
+        trash_transcript(&c, "t1").unwrap();
+        assert!(list_transcripts(&c, &ListFilter::default()).unwrap().is_empty());
+        assert!(search(&c, "revenu", 10).unwrap().is_empty());
+        assert!(search(&c, "Standup", 10).unwrap().is_empty());
+        let trash = list_transcripts(&c, &ListFilter { trashed: true, ..Default::default() }).unwrap();
+        assert_eq!((trash.len(), trash[0].trashed_at.is_some()), (1, true));
+        assert_eq!(trashed_ids(&c).unwrap(), vec!["t1".to_string()]);
+        restore_transcript(&c, "t1").unwrap();
+        assert_eq!(list_transcripts(&c, &ListFilter::default()).unwrap().len(), 1);
+        assert!(trashed_ids(&c).unwrap().is_empty());
+        update_tag(&c, tag.id, "urgent", "#0f0").unwrap();
+        assert_eq!(list_tags(&c).unwrap()[0].name, "urgent");
 
         rename_speaker(&c, "t1", "Speaker 1", "Alice").unwrap();
         assert_eq!(search(&c, "quarterly", 10).unwrap()[0].speaker.as_deref(), Some("Alice"));

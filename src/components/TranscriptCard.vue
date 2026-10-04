@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { AlertCircle, Folder, Loader2, Moon } from "@lucide/vue";
+import { AlertCircle, AlertTriangle, Folder, Loader2, Moon } from "@lucide/vue";
 import { Progress } from "@/components/ui/progress";
 import type { TranscriptSummary } from "@/lib/api";
-import { formatDuration } from "@/lib/format";
+import { formatDate, formatDuration } from "@/lib/format";
+import { fixReason, needsFix } from "@/lib/transcripts";
 import TranscriptMeta from "./TranscriptMeta.vue";
+import TranscriptActions from "./TranscriptActions.vue";
 import { useJobs } from "@/stores/jobs";
 import { useLibrary } from "@/stores/library";
 
@@ -20,11 +22,23 @@ const saved = computed(() =>
 <template>
   <RouterLink
     :to="{ name: 'transcript', params: { id: t.id } }"
-    class="hover:border-primary/40 hover:bg-accent/30 bg-card flex flex-col gap-2 rounded-xl border p-4 transition-colors"
+    class="group hover:border-primary/40 hover:bg-accent/30 bg-card flex flex-col gap-2 rounded-xl border p-4 transition-colors"
+    :class="t.flagged && 'border-amber-300 dark:border-amber-800'"
   >
-    <div class="grid gap-1">
-      <h3 class="line-clamp-1 font-medium">{{ t.title }}</h3>
-      <TranscriptMeta :t="t" />
+    <div class="flex items-start gap-2">
+      <div class="grid min-w-0 flex-1 gap-1">
+        <h3 class="line-clamp-1 font-medium">{{ t.title }}</h3>
+        <TranscriptMeta :t="t" />
+      </div>
+      <TranscriptActions :t="t" class="-mt-1 -mr-2" />
+    </div>
+
+    <div
+      v-if="needsFix(t) && t.status !== 'error'"
+      class="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400"
+      :title="fixReason(t)"
+    >
+      <AlertTriangle class="size-3.5 shrink-0" /> <span class="truncate">Needs fix · {{ fixReason(t) }}</span>
     </div>
 
     <div v-if="t.status === 'queued'" class="text-muted-foreground flex items-center gap-1.5 text-xs">
@@ -50,7 +64,8 @@ const saved = computed(() =>
         :style="{ backgroundColor: tag.color }"
       >{{ tag.name }}</span>
     </div>
-    <div v-if="saved !== null && t.status === 'done'" class="text-muted-foreground text-[11px]">
+    <div v-if="t.trashed_at" class="text-muted-foreground text-[11px]">Trashed {{ formatDate(t.trashed_at) }}</div>
+    <div v-else-if="saved !== null && t.status === 'done'" class="text-muted-foreground text-[11px]">
       {{ t.provider }} · sent {{ formatDuration(t.processed_duration) }} ({{ saved }}% less)
     </div>
   </RouterLink>
