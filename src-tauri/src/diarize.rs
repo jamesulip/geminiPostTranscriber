@@ -21,8 +21,60 @@ const SEGMENTATION_ARCHIVE: &str = "sherpa-onnx-pyannote-segmentation-3-0.tar.bz
 const SEGMENTATION_MODEL: &str = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx";
 /// Best of the embedding models tried on real meeting audio (see scripts/diarization-spike).
 pub const EMBEDDING_MODEL: &str = "3dspeaker_speech_eres2net_base_200k_sv_zh-cn_16k-common.onnx";
-/// Rough CPU throughput seen on an M-series Mac, for the progress estimate.
-const REALTIME_FACTOR: f64 = 12.0;
+/// Throughput to assume for the progress estimate before the first run has been measured.
+const DEFAULT_REALTIME_FACTOR: f64 = 10.0;
+
+/// Measured audio-seconds per wall-second from the last run, so the next estimate fits this machine.
+fn rate_file(data_dir: &Path) -> PathBuf {
+    models_dir(data_dir).join("rate.txt")
+}
+pub fn load_rate(data_dir: &Path) -> f64 {
+    std::fs::read_to_string(rate_file(data_dir)).ok().and_then(|s| s.trim().parse().ok()).filter(|r: &f64| *r > 0.5).unwrap_or(DEFAULT_REALTIME_FACTOR)
+}
+
+/// While this is alive the process is marked as doing user-initiated work: macOS then keeps it
+/// off App Nap and lets its threads run on the performance cores even when the window is in the
+/// background. Without it a 90-minute recording took 23 min instead of 9.
+struct BusyGuard {
+    #[cfg(target_os = "macos")]
+    activity: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+}
+
+// SAFETY: the activity token is only handed back to `endActivity`, which Apple documents as
+// callable from any thread; nothing else touches it.
+unsafe impl Send for BusyGuard {}
+
+impl BusyGuard {
+    fn begin(reason: &str) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+            let options = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+            let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &NSString::from_str(reason));
+            Self { activity }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = reason;
+            Self {}
+        }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe { objc2_foundation::NSProcessInfo::processInfo().endActivity(&self.activity) };
+    }
+}
+
+/// Ask macOS to schedule the calling thread as user-initiated work (performance cores).
+fn raise_thread_priority() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
 pub const STAGE: &str = "diarize";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,14 +159,18 @@ pub async fn ensure_models(app: &AppHandle, id: &str, data_dir: &Path, http: &re
 /// Run the diarizer on a 16 kHz mono WAV. Blocking; call from `spawn_blocking`.
 pub fn diarize_wav(seg_model: &Path, emb_model: &Path, wav: &Path, num_speakers: Option<i32>) -> Result<Vec<Turn>> {
     use sherpa_onnx::*;
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).clamp(2, 8) as i32;
+    let threads = std::env::var("DIAR_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).clamp(2, 8) as i32
+    });
+    let provider = std::env::var("DIAR_PROVIDER").ok();
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig { model: Some(seg_model.to_string_lossy().into()), ..Default::default() },
             num_threads: threads,
+            provider: provider.clone().or(Some("cpu".into())),
             ..Default::default()
         },
-        embedding: SpeakerEmbeddingExtractorConfig { model: Some(emb_model.to_string_lossy().into()), num_threads: threads, ..Default::default() },
+        embedding: SpeakerEmbeddingExtractorConfig { model: Some(emb_model.to_string_lossy().into()), num_threads: threads, provider: provider.or(Some("cpu".into())), ..Default::default() },
         // With a known speaker count the clustering is reliable; the threshold mode over-splits on
         // phone recordings (50-200 "speakers" on a 4-person meeting), so it's only a fallback.
         clustering: FastClusteringConfig { num_clusters: num_speakers.unwrap_or(-1), threshold: 0.9, ..Default::default() },
@@ -126,6 +182,7 @@ pub fn diarize_wav(seg_model: &Path, emb_model: &Path, wav: &Path, num_speakers:
     if wave.sample_rate() != sd.sample_rate() {
         bail!("Decoded audio is {} Hz, the model needs {} Hz", wave.sample_rate(), sd.sample_rate());
     }
+    raise_thread_priority();
     let result = sd.process(wave.samples()).ok_or_else(|| anyhow!("Diarization failed"))?;
     Ok(result
         .sort_by_start_time()
@@ -155,6 +212,8 @@ fn dominant(turns: &[Turn], start: f64, end: f64) -> Option<i32> {
 }
 
 pub struct Assignment {
+    /// Wall-clock seconds the diarizer itself took (0 when unknown).
+    pub seconds: f64,
     /// Segment id → new label (None: no diarizer speech under it).
     pub labels: Vec<(i64, Option<String>)>,
     /// Labels in order of first appearance, with display names carried over where possible.
@@ -196,6 +255,7 @@ pub fn assign(turns: &[Turn], segments: &[db::SegmentRow], old_names: &[Speaker]
         carried.insert(c, name);
     }
     Assignment {
+        seconds: 0.0,
         labels: clusters.into_iter().map(|(id, c)| (id, c.map(label))).collect(),
         speakers: order.iter().map(|&c| Speaker { label: label(c), display_name: carried.get(&c).cloned().unwrap_or_else(|| label(c)) }).collect(),
     }
@@ -224,8 +284,9 @@ pub async fn run(app: AppHandle, id: String, num_speakers: Option<i32>, cancel: 
         bail!("Cancelled");
     }
 
-    // No progress callback from the library: estimate from the audio length instead.
-    let expected = Duration::from_secs_f64((duration.max(60.0) / REALTIME_FACTOR).max(10.0));
+    // No progress callback from the library: estimate from the audio length and the last measured speed.
+    let _busy = BusyGuard::begin("Finding speakers");
+    let expected = Duration::from_secs_f64((duration.max(60.0) / load_rate(&state.data_dir)).max(10.0));
     let started = Instant::now();
     let ticker = {
         let (app, id) = (app.clone(), id.clone());
@@ -236,7 +297,7 @@ pub async fn run(app: AppHandle, id: String, num_speakers: Option<i32>, cancel: 
                 let msg = if left > 0 {
                     format!("Finding speakers (about {} left)…", if left >= 60 { format!("{} min", left.div_ceil(60)) } else { format!("{left} s") })
                 } else {
-                    "Finding speakers (almost done)…".to_string()
+                    format!("Finding speakers ({} min so far, longer than expected)…", started.elapsed().as_secs() / 60)
                 };
                 jobs::emit(&app, &id, STAGE, 0.1 + 0.85 * frac, msg);
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -250,12 +311,17 @@ pub async fn run(app: AppHandle, id: String, num_speakers: Option<i32>, cancel: 
     ticker.abort();
     let _ = std::fs::remove_file(&wav);
     let turns = turns?;
+    let elapsed = started.elapsed().as_secs_f64();
+    if duration > 60.0 && elapsed > 1.0 {
+        let _ = std::fs::write(rate_file(&state.data_dir), format!("{:.2}", duration / elapsed));
+    }
     if cancel.load(Ordering::Relaxed) {
         bail!("Cancelled");
     }
 
     jobs::emit(&app, &id, STAGE, 0.97, "Assigning speakers to the transcript…");
-    let assignment = assign(&turns, &segments, &speakers);
+    let mut assignment = assign(&turns, &segments, &speakers);
+    assignment.seconds = elapsed;
     {
         let mut db = state.db.lock().unwrap();
         db::apply_speakers(&mut db, &id, &assignment.labels, &assignment.speakers)?;
@@ -292,6 +358,24 @@ mod tests {
         assert_eq!(a.labels[3], (4, None));
         assert_eq!(a.speakers[0], Speaker { label: "Speaker 1".into(), display_name: "Ana".into() });
         assert_eq!(a.speakers[1].display_name, "Speaker 2");
+    }
+
+    /// Timing harness: `DIAR_WAV=… DIAR_MODELS=… cargo test --release time_diarize -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn time_diarize() {
+        let models = PathBuf::from(std::env::var("DIAR_MODELS").unwrap());
+        let wav = PathBuf::from(std::env::var("DIAR_WAV").unwrap());
+        let t0 = Instant::now();
+        let (seg, emb) = (models.join(SEGMENTATION_MODEL), models.join(EMBEDDING_MODEL));
+        let turns = if std::env::var("DIAR_IN_BLOCKING").is_ok() {
+            // Same path as the app: a tokio blocking thread.
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move { tokio::task::spawn_blocking(move || diarize_wav(&seg, &emb, &wav, Some(3))).await }).unwrap().unwrap()
+        } else {
+            diarize_wav(&seg, &emb, &wav, Some(3)).unwrap()
+        };
+        eprintln!("TIMING {:.1}s for {} turns", t0.elapsed().as_secs_f64(), turns.len());
     }
 
     #[test]

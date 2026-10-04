@@ -242,7 +242,7 @@ fn diarize_transcript(app: AppHandle, state: State<AppState>, id: String, num_sp
         state.cancels.lock().unwrap().remove(&id);
         state.progress.lock().unwrap().remove(&id);
         let (message, error) = match result {
-            Ok(a) => (format!("Found {} speaker(s)", a.speakers.len()), None),
+            Ok(a) => (format!("Found {} speaker(s) in {:.0} min", a.speakers.len(), a.seconds / 60.0), None),
             Err(e) => (String::new(), Some(format!("{e:#}"))),
         };
         use tauri::Emitter;
@@ -254,10 +254,17 @@ fn diarize_transcript(app: AppHandle, state: State<AppState>, id: String, num_sp
     Ok(())
 }
 
-/// Whether the diarization models are already downloaded (first run fetches about 45 MB).
+#[derive(serde::Serialize)]
+pub struct DiarizationInfo {
+    /// Models already downloaded (the first run fetches about 45 MB).
+    pub models_ready: bool,
+    /// Audio seconds processed per second on this machine (last run, else a default).
+    pub realtime_factor: f64,
+}
+
 #[tauri::command]
-fn diarization_models_ready(state: State<AppState>) -> bool {
-    diarize::models_ready(&state.data_dir)
+fn diarization_info(state: State<AppState>) -> DiarizationInfo {
+    DiarizationInfo { models_ready: diarize::models_ready(&state.data_dir), realtime_factor: diarize::load_rate(&state.data_dir) }
 }
 
 /// Stretches of the current version that look wrong (missing text, loops, impossible timings,
@@ -550,7 +557,7 @@ pub fn run() {
             playback_audio,
             audio_levels,
             diarize_transcript,
-            diarization_models_ready,
+            diarization_info,
             repair_transcript,
             cancel_job,
             job_progress,

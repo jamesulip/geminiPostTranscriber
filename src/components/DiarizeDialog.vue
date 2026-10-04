@@ -21,17 +21,24 @@ const emit = defineEmits<{ close: []; started: [] }>();
 
 const count = ref(String(Math.max(2, props.speakerCount || 2)));
 const modelsReady = ref<boolean | null>(null);
+/** Audio seconds per second on this machine (measured on the last run). */
+const rate = ref(10);
 const starting = ref(false);
 onMounted(async () => {
-  modelsReady.value = await api.diarizationModelsReady().catch(() => false);
+  try {
+    const info = await api.diarizationInfo();
+    modelsReady.value = info.models_ready;
+    rate.value = info.realtime_factor;
+  } catch {
+    modelsReady.value = false;
+  }
 });
 
 const n = computed(() => {
   const v = Number(count.value);
   return Number.isInteger(v) && v >= 1 && v <= 20 ? v : null;
 });
-/** About 12× realtime on an M-series Mac. */
-const minutes = computed(() => Math.max(1, Math.round(props.duration / 12 / 60)));
+const minutes = computed(() => Math.max(1, Math.round(props.duration / rate.value / 60)));
 
 async function start() {
   if (n.value === null) return;

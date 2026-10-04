@@ -263,7 +263,7 @@ export const api = {
   audioLevels: (id: string) => invoke<AudioLevels>("audio_levels", { id }),
   /** Find who spoke when with the local diarizer; progress arrives as a "diarize" job. */
   diarize: (id: string, numSpeakers: number | null) => invoke<void>("diarize_transcript", { id, numSpeakers }),
-  diarizationModelsReady: () => invoke<boolean>("diarization_models_ready"),
+  diarizationInfo: () => invoke<{ models_ready: boolean; realtime_factor: number }>("diarization_info"),
   speechInGaps: (id: string, gaps: [number, number][]) => invoke<number[]>("speech_in_gaps", { id, gaps }),
   repairTranscript: (id: string, ranges: [number, number][], options: JobOptions) =>
     invoke<void>("repair_transcript", { id, ranges, options }),
