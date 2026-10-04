@@ -83,7 +83,7 @@ pub async fn translate_transcript(ctx: &AiCtx<'_>, id: &str, force: bool) -> Res
 
 /// Map translated lines back onto segment indexes. Lines are matched in order; the `[time] Name:`
 /// prefix the prompt asked to keep is stripped. Extra or missing lines degrade gracefully.
-fn align(source: &str, translated: &str, first_idx: i64) -> BTreeMap<i64, String> {
+pub(crate) fn align(source: &str, translated: &str, first_idx: i64) -> BTreeMap<i64, String> {
     let src: Vec<&str> = source.lines().filter(|l| !l.trim().is_empty()).collect();
     let out: Vec<&str> = translated.lines().filter(|l| !l.trim().is_empty()).collect();
     let strip = |l: &str| -> String {

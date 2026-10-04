@@ -692,6 +692,13 @@ async fn ai_document(app: AppHandle, scope: ai::Scope, template_id: String) -> C
     handle.await.map_err(err)?
 }
 
+/// Clean verbatim / smart rewrite of a version, saved as a new version (background; key `cleanup:<id>`).
+#[tauri::command]
+fn ai_cleanup(app: AppHandle, id: String, version_id: Option<i64>, level: ai::cleanup::Level) -> CmdResult<()> {
+    ai_run(&app, format!("cleanup:{id}"), move |ctx| Box::pin(async move { ai::cleanup::clean_transcript(ctx, &id, version_id, level).await.map(|_| ()) }))?;
+    Ok(())
+}
+
 /// English translation of a transcript (background; progress key `translate:<id>`, result via `ai_get_digests`).
 #[tauri::command]
 fn ai_translate(app: AppHandle, id: String, force: bool) -> CmdResult<()> {
@@ -846,6 +853,7 @@ pub fn run() {
             ai_templates,
             ai_document,
             ai_translate,
+            ai_cleanup,
             save_text,
             list_folders,
             create_folder,

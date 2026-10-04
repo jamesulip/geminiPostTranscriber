@@ -27,7 +27,8 @@ import DiarizeDialog from "@/components/DiarizeDialog.vue";
 import TranscriptMeta from "@/components/TranscriptMeta.vue";
 import TranscriptList from "@/components/TranscriptList.vue";
 import AiPanel from "@/components/AiPanel.vue";
-import { ClipboardCopy, Languages, Sparkles } from "@lucide/vue";
+import { ClipboardCopy, Languages, Sparkles, WandSparkles } from "@lucide/vue";
+import type { CleanupLevel } from "@/lib/api";
 import { useAi } from "@/stores/ai";
 import { useLocalStorage } from "@vueuse/core";
 import FixProblemsDialog from "@/components/FixProblemsDialog.vue";
@@ -135,6 +136,20 @@ async function copyAsContext() {
   const head = `# ${t.value.title}${t.value.recorded_at ? ` (${formatDate(t.value.recorded_at)})` : ""}\n\n`;
   await navigator.clipboard.writeText(head + lines.join("\n"));
   toast.success(`Copied ${lines.length} line(s)`);
+}
+
+/** Clean-up (non-verbatim copy) of a chosen version, saved as a new version. */
+const cleanup = ref<{ versionId: number | null; level: CleanupLevel } | null>(null);
+const cleaning = computed(() => ai.running[`cleanup:${id.value}`]);
+watch(cleaning, (now, before) => { if (before && !now) void load(); });
+async function startCleanup() {
+  if (!cleanup.value) return;
+  try {
+    await api.aiCleanup(id.value, cleanup.value.versionId, cleanup.value.level);
+    cleanup.value = null;
+  } catch (e) {
+    toast.error("Couldn't start the clean-up", { description: String(e) });
+  }
 }
 
 /** Right-hand assistant panel (summary + questions); ⌘J toggles it. */
@@ -542,10 +557,11 @@ const saved = computed(() =>
           <p v-if="!versions.length" class="text-muted-foreground px-2 py-1.5 text-xs">
             Re-transcribing keeps earlier versions here.
           </p>
-          <template v-else>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem :disabled="!canCompare" @click="openCompare(viewing?.id)"><GitCompare /> Compare versions…</DropdownMenuItem>
-          </template>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem v-if="versions.length" :disabled="!canCompare" @click="openCompare(viewing?.id)"><GitCompare /> Compare versions…</DropdownMenuItem>
+          <DropdownMenuItem :disabled="!t.segments.length || !!cleaning || busy" @click="cleanup = { versionId: viewing?.id ?? null, level: 'clean' }">
+            <WandSparkles /> Clean up transcript…
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
       <DropdownMenu>
@@ -646,6 +662,13 @@ const saved = computed(() =>
       <AlertTriangle class="size-4 shrink-0 text-amber-600" />
       <span class="min-w-0 truncate" :title="t.error">Last re-transcription failed — still showing v{{ t.version }}. {{ t.error }}</span>
       <Button size="sm" variant="outline" class="ml-auto shrink-0" @click="openRetry"><RefreshCw /> Retry</Button>
+    </div>
+
+    <div v-if="cleaning" class="flex items-center gap-3 border-b px-6 py-2 text-sm">
+      <WandSparkles class="text-primary size-4 shrink-0" />
+      <span class="min-w-0 truncate">{{ cleaning.message }}</span>
+      <Progress :model-value="cleaning.progress * 100" class="h-1.5 w-56" />
+      <Button size="sm" variant="ghost" class="ml-auto shrink-0" @click="ai.cancel(`cleanup:${t.id}`)">Cancel</Button>
     </div>
 
     <div v-if="diarizeJob" class="flex items-center gap-3 border-b px-6 py-2 text-sm">
@@ -945,6 +968,45 @@ const saved = computed(() =>
       @close="renaming = null"
       @submit="renameSpeaker"
     />
+
+    <Dialog :open="!!cleanup" @update:open="(o) => !o && (cleanup = null)">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader><DialogTitle>Clean up transcript</DialogTitle></DialogHeader>
+        <div v-if="cleanup" class="grid gap-4 text-sm">
+          <p class="text-muted-foreground -mt-2 text-xs">
+            Makes a non-verbatim copy with the AI assistant and saves it as a new version. The version you start from stays in the history.
+          </p>
+          <div class="grid gap-1.5">
+            <span class="text-xs font-medium">Start from</span>
+            <Select :model-value="String(cleanup.versionId ?? 'current')" @update:model-value="(v) => (cleanup!.versionId = v === 'current' ? null : Number(v))">
+              <SelectTrigger class="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="current">v{{ t.version }} · current · {{ t.model }}</SelectItem>
+                <SelectItem v-for="v in versions" :key="v.id" :value="String(v.id)">v{{ v.number }} · {{ v.model }} · {{ formatDate(v.transcribed_at) }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div class="grid gap-2">
+            <label class="flex cursor-pointer items-start gap-3 rounded-lg border p-3" :class="cleanup.level === 'clean' && 'border-primary'">
+              <input v-model="cleanup.level" type="radio" value="clean" class="mt-1" />
+              <span><b>Clean verbatim</b><br /><span class="text-muted-foreground text-xs">Removes fillers, stutters and false starts; keeps every other word. Safe for quoting.</span></span>
+            </label>
+            <label class="flex cursor-pointer items-start gap-3 rounded-lg border p-3" :class="cleanup.level === 'smart' && 'border-primary'">
+              <input v-model="cleanup.level" type="radio" value="smart" class="mt-1" />
+              <span><b>Smart rewrite</b><br /><span class="text-muted-foreground text-xs">Rewrites each turn into clear sentences with the same meaning, names and numbers. Reads like notes; it is an interpretation.</span></span>
+            </label>
+          </div>
+          <p class="text-muted-foreground text-xs">
+            Roughly {{ Math.round(t.segments.reduce((a, s) => a + s.text.length, 0) / 3000) }}k tokens each way; a few minutes for a long meeting.
+            The summary and search index will show as outdated afterwards and refresh on next use.
+          </p>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" @click="cleanup = null">Cancel</Button>
+          <Button @click="startCleanup"><WandSparkles /> Start</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <Dialog :open="!!retry" @update:open="(o) => !o && (retry = null)">
       <DialogContent class="sm:max-w-lg">

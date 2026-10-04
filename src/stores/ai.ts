@@ -41,6 +41,9 @@ export const useAi = defineStore("ai", () => {
           const id = p.key.slice(p.key.indexOf(":") + 1);
           digestVersion[id] = (digestVersion[id] ?? 0) + 1;
           if (p.error && p.error !== "Cancelled") toast.error(p.key.startsWith("digest:") ? "Summary failed" : "Translation failed", { description: p.error });
+        } else if (p.key.startsWith("cleanup:")) {
+          if (p.error && p.error !== "Cancelled") toast.error("Clean-up failed", { description: p.error });
+          else if (!p.error) toast.success("Transcript cleaned up", { description: p.message });
         } else if (p.key === "embed:library") {
           if (p.error) toast.error("Indexing failed", { description: p.error });
           else toast.success(p.message || "Library indexed");

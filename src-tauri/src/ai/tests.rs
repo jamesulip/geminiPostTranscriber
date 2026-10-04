@@ -168,6 +168,20 @@ async fn ai_end_to_end() {
         assert!(store::digest(&db.lock().unwrap(), "t1", "doc:mom").unwrap().is_some());
         assert!(docs::generate(&ctx, &Scope::Library, "nope").await.is_err());
 
+        // Clean-up of the current version becomes a new version; the source stays in history.
+        if kind == ProviderKind::Openai {
+            let before: i64 = db.lock().unwrap().query_row("SELECT version FROM transcripts WHERE id = 't1'", [], |r| r.get(0)).unwrap();
+            let v = cleanup::clean_transcript(&ctx, "t1", None, cleanup::Level::Clean).await.unwrap();
+            assert_eq!(v, before + 1);
+            let versions = db::list_versions(&db.lock().unwrap(), "t1").unwrap();
+            assert!(versions.iter().any(|x| x.number == before));
+            let t = db::get_transcript(&db.lock().unwrap(), "t1").unwrap().unwrap();
+            assert!(t.segments.len() >= 18 && t.summary.model.contains("clean verbatim"));
+            assert!(store::digest(&db.lock().unwrap(), "t1", "summary").unwrap().unwrap().stale);
+            // Put the digest back in sync for the rest of the test.
+            digest::digest_transcript(&ctx, "t1", true).await.unwrap();
+        }
+
         // Whole-transcript mode; on Gemini this goes through cachedContents.
         let full = ask::ask(&ctx, ask::AskParams { thread_id: None, scope: Scope::Transcript { id: "t1".into() }, question: format!("Summarise everything ({kind:?})"), read_all: true }).await.unwrap();
         if kind == ProviderKind::Gemini {

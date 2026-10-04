@@ -10,6 +10,7 @@
 pub mod ask;
 pub mod cache;
 pub mod chat;
+pub mod cleanup;
 pub mod chunker;
 pub mod digest;
 pub mod docs;

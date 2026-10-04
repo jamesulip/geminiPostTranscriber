@@ -389,6 +389,9 @@ export interface AiTemplate {
   builtin?: boolean;
 }
 
+/** Non-verbatim copy: "clean" removes fillers/false starts; "smart" rewrites turns into clear sentences. */
+export type CleanupLevel = "clean" | "smart";
+
 export interface AskParams {
   thread_id: string | null;
   scope: Scope;
@@ -460,6 +463,8 @@ export const api = {
   /** Translate to English in the background; result arrives as the `translation_en` digest. */
   aiTranslate: (id: string, force = false) => invoke<void>("ai_translate", { id, force }),
   saveText: (path: string, text: string) => invoke<void>("save_text", { path, text }),
+  /** Clean up a version in the background (key `cleanup:<id>`); the result becomes the new current version. */
+  aiCleanup: (id: string, versionId: number | null, level: CleanupLevel) => invoke<void>("ai_cleanup", { id, versionId, level }),
 
   knownPrice: (model: string) =>
     invoke<{ per_minute: number; tokens: [number, number] | null; text: TextPrice | null }>("known_price", { model }),
