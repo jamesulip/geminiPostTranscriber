@@ -50,7 +50,7 @@ Anthropic; the Anthropic entry only serves the assistant, it can't transcribe).
   (Anthropic uses `cache_control` on the transcript block automatically). Identical first questions over
   unchanged transcripts are answered from the store without a model call.
 - **Meaning search**: ⌘K shows "By meaning" hits once transcripts are indexed (summaries index them; Settings has
-  an "Index library" button). Embeddings are 768-dim f32 BLOBs in SQLite; no vector database.
+  an "Index library" button). Embeddings (default `gemini-embedding-2`, 768 dims) are f32 BLOBs in SQLite; no vector database.
 - **Glossary feedback**: terms from earlier meetings in the same folder are passed to Gemini and Whisper
   transcription prompts so names and jargon are spelled consistently.
 - **English**: the transcript toolbar's "English" toggle translates once (stored as the `translation_en` digest).

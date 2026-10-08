@@ -56,19 +56,30 @@ pub async fn embed(http: &reqwest::Client, cfg: &ProviderConfig, texts: &[String
     Ok((out, usage))
 }
 
-async fn gemini(http: &reqwest::Client, cfg: &ProviderConfig, texts: &[String], task: EmbedTask) -> Result<(Vec<Vec<f32>>, TokenUsage)> {
-    let model = format!("models/{}", cfg.model.trim_start_matches("models/"));
-    let requests: Vec<Value> = texts
+/// One `batchEmbedContents` entry per text. `gemini-embedding-001` takes a `taskType`;
+/// `gemini-embedding-2` rejects that field and takes the task as a text prefix instead.
+pub fn gemini_requests(model: &str, texts: &[String], task: EmbedTask) -> Vec<Value> {
+    let model_path = format!("models/{}", model.trim_start_matches("models/"));
+    let v2 = model.contains("embedding-2");
+    texts
         .iter()
         .map(|t| {
-            json!({
-                "model": model,
-                "content": { "parts": [{ "text": t }] },
-                "taskType": if task == EmbedTask::Query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" },
-                "outputDimensionality": DIMENSIONS,
-            })
+            let text = match (v2, task) {
+                (true, EmbedTask::Query) => format!("task: search result | query: {t}"),
+                _ => t.clone(),
+            };
+            let mut r = json!({ "model": model_path, "content": { "parts": [{ "text": text }] }, "outputDimensionality": DIMENSIONS });
+            if !v2 {
+                r["taskType"] = json!(if task == EmbedTask::Query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" });
+            }
+            r
         })
-        .collect();
+        .collect()
+}
+
+async fn gemini(http: &reqwest::Client, cfg: &ProviderConfig, texts: &[String], task: EmbedTask) -> Result<(Vec<Vec<f32>>, TokenUsage)> {
+    let model = format!("models/{}", cfg.model.trim_start_matches("models/"));
+    let requests = gemini_requests(&cfg.model, texts, task);
     let url = format!("{}/v1beta/{model}:batchEmbedContents", cfg.base_url.trim_end_matches('/'));
     let resp = http
         .post(url)
@@ -131,6 +142,20 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_2_takes_task_as_text_not_field() {
+        let texts = vec!["hello".to_string()];
+        let v1 = gemini_requests("gemini-embedding-001", &texts, EmbedTask::Query);
+        assert_eq!(v1[0]["taskType"], "RETRIEVAL_QUERY");
+        assert_eq!(v1[0]["content"]["parts"][0]["text"], "hello");
+        let v2 = gemini_requests("gemini-embedding-2", &texts, EmbedTask::Query);
+        assert!(v2[0].get("taskType").is_none());
+        assert_eq!(v2[0]["content"]["parts"][0]["text"], "task: search result | query: hello");
+        let doc = gemini_requests("gemini-embedding-2", &texts, EmbedTask::Document);
+        assert_eq!(doc[0]["content"]["parts"][0]["text"], "hello");
+        assert_eq!(doc[0]["outputDimensionality"], DIMENSIONS);
+    }
 
     #[test]
     fn blobs_round_trip_and_normalise() {

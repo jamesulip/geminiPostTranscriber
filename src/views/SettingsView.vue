@@ -220,7 +220,7 @@ async function save() {
             <div class="grid gap-1.5">
               <Label>Chat model</Label>
               <Input v-model="form.ai_model" :placeholder="chatPlaceholder" />
-              <p class="text-muted-foreground text-xs">Gemini: gemini-3.8-flash is cheap and has context caching. Anthropic: claude-opus-5-5 (claude-sonnet-5-5 is cheaper). Groq/OpenAI: any chat model.</p>
+              <p class="text-muted-foreground text-xs">Gemini: gemini-3.8-flash ($0.75 / $3.75 per 1M, cached $0.075) has context caching. Anthropic: claude-opus-5-5 (claude-sonnet-5-5 is cheaper). Groq/OpenAI: any chat model.</p>
             </div>
             <div class="col-span-2 flex items-center gap-3">
               <Button variant="outline" size="sm" :disabled="testing || !form.ai_provider" @click="testAi">
@@ -240,8 +240,8 @@ async function save() {
             </div>
             <div class="grid gap-1.5">
               <Label>Embedding model</Label>
-              <Input v-model="form.ai_embedding_model" placeholder="gemini-embedding-001" />
-              <p class="text-muted-foreground text-xs">Changing it re-indexes everything on next use. OpenAI: text-embedding-3-small.</p>
+              <Input v-model="form.ai_embedding_model" placeholder="gemini-embedding-2" />
+              <p class="text-muted-foreground text-xs">gemini-embedding-2 (multilingual, $0.20 per 1M tokens) or gemini-embedding-001; OpenAI: text-embedding-3-small. Changing it re-indexes everything on next use.</p>
             </div>
             <div class="col-span-2 flex items-start justify-between gap-4 rounded-lg border p-3">
               <div class="grid gap-0.5">

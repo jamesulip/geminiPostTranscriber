@@ -55,6 +55,15 @@ pub fn known_text_price(model: &str) -> Option<TextPrice> {
     if let Some((_, p)) = anthropic.iter().find(|(k, _)| m.contains(k)) {
         return Some(*p);
     }
+    // Gemini text rates (Oct 2026): 3.8 Flash $0.75 / $3.75, cached $0.075; Embedding 2 $0.20 per 1M input.
+    let gemini: &[(&str, TextPrice)] = &[
+        ("gemini-embedding-2", TextPrice { input: 0.20, output: 0.0, cached_input: 0.0 }),
+        ("gemini-embedding", TextPrice { input: 0.15, output: 0.0, cached_input: 0.0 }),
+        ("gemini-3.8-flash", TextPrice { input: 0.75, output: 3.75, cached_input: 0.075 }),
+    ];
+    if let Some((_, p)) = gemini.iter().find(|(k, _)| m.contains(k)) {
+        return Some(*p);
+    }
     known_token_price(model).map(|(i, o)| TextPrice { input: i, output: o, cached_input: i * 0.25 })
 }
 
@@ -255,7 +264,7 @@ impl Default for Settings {
             ai_provider: "gemini".into(),
             ai_model: "gemini-3.8-flash".into(),
             ai_embedding_provider: "gemini".into(),
-            ai_embedding_model: "gemini-embedding-001".into(),
+            ai_embedding_model: "gemini-embedding-2".into(),
             ai_auto_digest: true,
             ai_context_cache: false,
             ai_context_cache_ttl_minutes: 60,
@@ -288,7 +297,7 @@ pub fn anthropic_provider() -> ProviderConfig {
     }
 }
 
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 pub fn load(path: &Path) -> Settings {
     let s: Settings = std::fs::read_to_string(path)
@@ -320,6 +329,14 @@ fn migrate(mut s: Settings) -> Settings {
     if s.settings_version < 4 {
         // v4: AI assistant; an Anthropic entry so a key can be pasted without creating a provider.
         s.settings_version = 4;
+    }
+    if s.settings_version < 5 {
+        // v5: Gemini Embedding 2 (GA April 2026): 8k-token inputs, multilingual, $0.20/M. Chunks are
+        // re-embedded on next use because vectors are tagged with their model.
+        if s.ai_embedding_model == "gemini-embedding-001" {
+            s.ai_embedding_model = "gemini-embedding-2".into();
+        }
+        s.settings_version = 5;
     }
     if !s.providers.iter().any(|p| p.kind == ProviderKind::Anthropic) {
         s.providers.push(anthropic_provider());
@@ -364,7 +381,8 @@ mod tests {
             "remove_silence": true, "silence_threshold_db": -35, "silence_min_duration": 0.7,
             "chunk_minutes": 10, "gemini_chunk_minutes": 25}"#;
         let s = migrate(serde_json::from_str(v1).unwrap());
-        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 4));
+        assert_eq!((s.default_provider.as_str(), s.speed, s.settings_version), ("groq", 1.5, 5));
+        assert_eq!(s.ai_embedding_model, "gemini-embedding-2");
         assert!(s.providers.iter().any(|p| p.kind == ProviderKind::Anthropic));
         assert_eq!(s.ai_provider, "");
         assert_eq!(s.gemini_chunk_minutes, 10.0);
