@@ -42,6 +42,18 @@
     ],
     "externalBin": [
       "binaries/ffmpeg"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "PASTE_CONTENTS_OF_~/.tauri/transcriber.key.pub",
+      "endpoints": [
+        "https://github.com/jamesulip/geminiPostTranscriber/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

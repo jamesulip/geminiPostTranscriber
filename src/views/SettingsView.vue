@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watchEffect } from "vue";
-import { Eye, EyeOff, Loader2, Plus, Sparkles, Trash2 } from "@lucide/vue";
+import { Download, Eye, EyeOff, Loader2, Plus, RefreshCw, RotateCw, Sparkles, Trash2 } from "@lucide/vue";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "vue-sonner";
 import { Button } from "@/components/ui/button";
@@ -12,12 +12,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { api, defaultChatModel, diarizes, transcribes, PROVIDER_KIND_LABEL, type ProviderKind, type SilenceMethod, type Settings } from "@/lib/api";
 import { useAi } from "@/stores/ai";
 import { useSettings } from "@/stores/settings";
+import { useUpdates } from "@/stores/updates";
 
 const store = useSettings();
 const form = ref<Settings | null>(null);
 const reveal = ref<Record<string, boolean>>({});
 const BUILTIN = ["groq", "openai", "gemini", "anthropic"];
 const ai = useAi();
+const updates = useUpdates();
 const testing = ref(false);
 const testResult = ref<string | null>(null);
 
@@ -386,6 +388,26 @@ async function save() {
               <Input v-model.number="form.gemini_chunk_minutes" type="number" min="1" max="30" />
               <p class="text-muted-foreground text-xs">Shorter chunks are more reliable (long ones can skip or repeat speech); longer ones keep speaker labels more consistent. 10 min recommended.</p>
             </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Updates</CardTitle>
+            <CardDescription>
+              Version {{ updates.version || "unknown" }}. New releases are checked a few seconds after launch and every 6 hours.
+            </CardDescription>
+          </CardHeader>
+          <CardContent class="flex flex-wrap items-center gap-3">
+            <Button v-if="updates.status === 'ready'" @click="updates.relaunch()"><RotateCw /> Restart to finish updating</Button>
+            <Button v-else-if="updates.status === 'available' || updates.status === 'downloading'" :disabled="updates.status === 'downloading'" @click="updates.install()">
+              <Loader2 v-if="updates.status === 'downloading'" class="animate-spin" /><Download v-else />
+              {{ updates.status === "downloading" ? `Downloading… ${updates.percent}%` : `Install ${updates.update?.version}` }}
+            </Button>
+            <Button v-else variant="outline" :disabled="updates.status === 'checking'" @click="updates.checkNow()">
+              <Loader2 v-if="updates.status === 'checking'" class="animate-spin" /><RefreshCw v-else /> Check for updates
+            </Button>
+            <p v-if="updates.status === 'error'" class="text-destructive text-xs">{{ updates.error }}</p>
           </CardContent>
         </Card>
       </div>

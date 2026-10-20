@@ -30,6 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A build with the placeholder key still succeeds, but its installs could never verify an update.
+      - name: Check updater public key
+        shell: bash
+        run: |
+          if grep -q PASTE_ src-tauri/tauri.conf.json; then
+            echo "::error::Set plugins.updater.pubkey in tauri.conf.json to the contents of ~/.tauri/transcriber.key.pub"
+            exit 1
+          fi
+
       - name: Install Tauri system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -60,6 +69,9 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater bundles; tauri-action then uploads latest.json for the in-app updater.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # sherpa-onnx ships static-MT (static CRT) Windows libs.
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
         with:

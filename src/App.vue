@@ -9,14 +9,16 @@ import { useLibrary } from "@/stores/library";
 import { useJobs } from "@/stores/jobs";
 import { useSettings } from "@/stores/settings";
 import { useAi } from "@/stores/ai";
+import { useUpdates } from "@/stores/updates";
 
 const library = useLibrary();
 const jobs = useJobs();
 const settings = useSettings();
 const ai = useAi();
+const updates = useUpdates();
 
 onMounted(async () => {
-  await Promise.all([library.refreshMeta(), library.refresh(), jobs.start(), settings.load(), ai.start()]);
+  await Promise.all([library.refreshMeta(), library.refresh(), jobs.start(), settings.load(), ai.start(), updates.start()]);
 });
 </script>
 
