@@ -47,7 +47,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "PASTE_CONTENTS_OF_~/.tauri/transcriber.key.pub",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU1QUQyRThFMDZDMTAxRDMKUldUVEFjRUdqaTZ0Vlg4VEZxcGxxK2Zka0l3dVpDMGpLRy9jeEdMS1JUZXN4ZUlLV3ZSQWNjRGUK",
       "endpoints": [
         "https://github.com/jamesulip/geminiPostTranscriber/releases/latest/download/latest.json"
       ],
