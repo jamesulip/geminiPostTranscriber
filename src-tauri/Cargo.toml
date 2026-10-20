@@ -1,6 +1,6 @@
 [package]
 name = "transcriber"
-version = "0.1.0"
+version = "0.1.1"
 description = "Audio transcriber"
 authors = ["you"]
 edition = "2021"
