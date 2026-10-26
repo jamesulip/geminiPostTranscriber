@@ -12,14 +12,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    # macOS like the release builds: sherpa-onnx (speaker detection) ships no Linux static
+    # library for the crate to link, so the Linux runner couldn't compile it.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev build-essential
 
       - uses: pnpm/action-setup@v4
         with:
@@ -43,9 +40,9 @@ jobs:
       # tauri-build requires the sidecar to exist; the audio tests run ffmpeg from PATH.
       - name: Fetch ffmpeg sidecar
         run: |
-          ./scripts/fetch-ffmpeg.sh x86_64-unknown-linux-gnu
+          ./scripts/fetch-ffmpeg.sh aarch64-apple-darwin
           mkdir -p "$RUNNER_TEMP/bin"
-          ln -s "$PWD/src-tauri/binaries/ffmpeg-x86_64-unknown-linux-gnu" "$RUNNER_TEMP/bin/ffmpeg"
+          ln -s "$PWD/src-tauri/binaries/ffmpeg-aarch64-apple-darwin" "$RUNNER_TEMP/bin/ffmpeg"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Rust tests
