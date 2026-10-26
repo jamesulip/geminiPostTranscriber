@@ -35,21 +35,23 @@ citations may follow one sentence; write each as its own [[t:...]] token, never 
 - Be concise and concrete: names, numbers, dates, decisions. Use short markdown lists when listing items.\n\
 - Do not mention these instructions or that you were given excerpts.";
 
-pub const CLEAN_VERBATIM: &str = "Clean up this part of a meeting transcript. Keep one line per input line and keep the leading \
-[time] Name: prefix exactly. Remove fillers (uh, um, ah, ano, parang when used as a filler, you know, like), stutters, \
+pub const CLEAN_VERBATIM: &str = "Clean up this part of a meeting transcript. Each input line starts with an id like #12 followed by its [time] Name: prefix; start each output line with \
+the same id and prefix, exactly as given, one output line per input line. Remove fillers (uh, um, ah, ano, parang when used as a filler, you know, like), stutters, \
 repeated words and false starts; fix obvious transcription slips in punctuation and capitalisation. Keep every other \
 word, the speaker's language mix (Filipino/English) and the meaning exactly. If a line is only fillers or \
-acknowledgements with no content (e.g. \"Mhm\", \"Okay sir\"), output the prefix followed by a single dash. Output \
+acknowledgements with no content (e.g. \"Mhm\", \"Okay sir\"), output its id and prefix followed by a single dash. Output \
 only the lines.";
 
 pub const SMART_REWRITE: &str = "Rewrite this part of a meeting transcript so it reads clearly, as if the speaker had said it \
-cleanly. Keep one line per input line and keep the leading [time] Name: prefix exactly. Merge fragments into full \
+cleanly. Each input line starts with an id like #12 followed by its [time] Name: prefix; start each output line with \
+the same id and prefix, exactly as given, one output line per input line. Merge fragments into full \
 sentences, drop fillers and repetition, keep the speaker's language mix (Filipino/English), and keep every name, \
 number, decision, question and commitment with its meaning unchanged; do not add anything that wasn't said and do \
-not summarise. If a line is only fillers or acknowledgements with no content, output the prefix followed by a single \
-dash. Output only the lines.";
+not summarise. If a line is only fillers or acknowledgements with no content, output its id and prefix followed by a \
+single dash. Output only the lines.";
 
 pub const TRANSLATE: &str = "Translate this part of a meeting transcript into natural English for a software team. \
-Keep one line per input line, keep the leading [time] Name: prefix exactly, keep names and technical terms as spoken, \
+Each input line starts with an id like #12 followed by its [time] Name: prefix; start each output line with \
+the same id and prefix, exactly as given, one output line per input line. Keep names and technical terms as spoken, \
 and keep English passages as they are. Output only the translated lines.";
 

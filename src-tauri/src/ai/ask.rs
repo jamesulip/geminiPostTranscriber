@@ -212,13 +212,13 @@ pub async fn ask(ctx: &AiCtx<'_>, p: AskParams) -> Result<Answer> {
     Ok(Answer { thread, message: saved, note })
 }
 
-/// Models sometimes group citations as `[[t:a:1], [t:b:2]]`; split them into separate tokens.
+/// Models sometimes group citations as `[[t:a:1], [t:b:2]]` or write ranges as `[[t:a:1]–[t:a:9]]`;
+/// split them into separate tokens.
 pub fn normalize_citations(text: &str) -> String {
-    let group = regex::Regex::new(r"\[\[(t:[^\[\]]+(?:\]\s*,\s*\[t:[^\[\]]+)+)\]\]").unwrap();
+    let group = regex::Regex::new(r"\[\[(t:[^\[\]]+(?:\]\s*[,–—-]+\s*\[t:[^\[\]]+)+)\]\]").unwrap();
+    let sep = regex::Regex::new(r"\]\s*[,–—-]+\s*\[").unwrap();
     group
-        .replace_all(text, |c: &regex::Captures| {
-            c[1].split("],").map(|p| format!("[[{}]]", p.trim().trim_start_matches('[').trim_end_matches(']'))).collect::<Vec<_>>().join(" ")
-        })
+        .replace_all(text, |c: &regex::Captures| sep.split(&c[1]).map(|p| format!("[[{}]]", p.trim())).collect::<Vec<_>>().join(" "))
         .into_owned()
 }
 
@@ -268,5 +268,11 @@ mod tests {
         let (text, cites) = validate_citations("x [[t:abc:936], [t:abc:997]].", &allowed, &titles);
         assert_eq!(text, "x [[t:abc:936]] [[t:abc:997]].");
         assert_eq!(cites.len(), 2);
+        // Ranges with any dash.
+        for sep in ["--", "–", "—", "-", " – "] {
+            let (text, cites) = validate_citations(&format!("y [[t:abc:1]{sep}[t:abc:9]]."), &allowed, &titles);
+            assert_eq!(text, "y [[t:abc:1]] [[t:abc:9]].");
+            assert_eq!(cites.len(), 2);
+        }
     }
 }

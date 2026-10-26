@@ -3,10 +3,10 @@
 import { formatTime } from "./format";
 
 const CITE = /\[\[t:([0-9A-Za-z_-]+):([0-9]+(?:\.[0-9]+)?)\]\]/g;
-/** Grouped form some models produce: `[[t:a:1], [t:b:2]]` → separate tokens. */
-const GROUPED = /\[\[(t:[^[\]]+(?:\]\s*,\s*\[t:[^[\]]+)+)\]\]/g;
+/** Grouped and range forms some models produce: `[[t:a:1], [t:b:2]]`, `[[t:a:1]–[t:a:9]]` → separate tokens. */
+const GROUPED = /\[\[(t:[^[\]]+(?:\]\s*[,–—-]+\s*\[t:[^[\]]+)+)\]\]/g;
 function normalizeCitations(s: string): string {
-  return s.replace(GROUPED, (_m, inner: string) => inner.split("],").map((p) => `[[${p.trim().replace(/^\[/, "").replace(/\]$/, "")}]]`).join(" "));
+  return s.replace(GROUPED, (_m, inner: string) => inner.split(/\]\s*[,–—-]+\s*\[/).map((p) => `[[${p.trim()}]]`).join(" "));
 }
 
 export function escapeHtml(s: string): string {

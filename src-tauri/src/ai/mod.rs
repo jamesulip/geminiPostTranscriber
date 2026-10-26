@@ -15,6 +15,7 @@ pub mod chunker;
 pub mod digest;
 pub mod docs;
 pub mod embed;
+pub mod lines;
 pub mod prompts;
 pub mod retrieval;
 pub mod sse;

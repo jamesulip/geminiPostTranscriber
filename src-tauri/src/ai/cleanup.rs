@@ -3,8 +3,7 @@
 //! chunk by chunk, saved as a new version so the verbatim one stays in the history.
 
 use super::chat::{complete, ChatCall, ChatMessage, ChatRequest, Role, SystemBlock};
-use super::translate::align;
-use super::{chunker, prompts, usage, AiCtx};
+use super::{chunker, lines, prompts, usage, AiCtx};
 use crate::db::{self, SegmentRow, Speaker};
 use crate::providers::{Segment, TokenUsage};
 use anyhow::{anyhow, bail, Context, Result};
@@ -75,7 +74,7 @@ pub async fn clean_transcript(ctx: &AiCtx<'_>, id: &str, version_id: Option<i64>
                     bail!("Cancelled");
                 }
                 let system = [SystemBlock { text: level.prompt().into(), cache: false }];
-                let msg = [ChatMessage { role: Role::User, content: ch.text.clone() }];
+                let msg = [ChatMessage { role: Role::User, content: lines::with_ids(&ch.text, ch.first_idx) }];
                 let req = ChatRequest { system: &system, messages: &msg, max_tokens: 8192, json: false, cached_content: None, temperature: Some(0.1) };
                 let call = ChatCall { cancel: ctx.cancel, on_retry, on_delta: None };
                 let r = complete(ctx.http, cfg, &req, &call).await.with_context(|| format!("cleaning part {}", ch.idx + 1))?;
@@ -84,7 +83,7 @@ pub async fn clean_transcript(ctx: &AiCtx<'_>, id: &str, version_id: Option<i64>
                     t.0 += r.usage;
                     t.1 += 1;
                 }
-                let map = align(&ch.text, &r.text, ch.first_idx);
+                let map = lines::parse(&ch.text, &r.text, ch.first_idx);
                 let mut d = done.lock().unwrap();
                 *d += 1;
                 ctx.progress(key, format!("Cleaned part {}/{n}", *d), 0.02 + 0.93 * (*d as f64 / n as f64));
